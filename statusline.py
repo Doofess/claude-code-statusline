@@ -6,13 +6,14 @@
 
 One line, always (Claude Code draws its own mode line below it), left to right:
     project › branch ~N “session-name” │ model · effort │ ctx N% bar used/size │
-    5h N% bar reset │ 7d N% bar reset │ $cost │ session time │ health marks │
-    skills │ venv │ :ports
+    5h N% bar →reset │ 7d N% bar →reset │ $cost │ session time │ ✓ mcp N · version │
+    skills N │ venv │ :ports
 
 It is designed for a 120-column window and fits itself to COLUMNS: wider windows show
 more, narrower ones drop items by priority (see format_statusline). It never wraps.
-Items with nothing to show (no session name, no ports, no venv) are left out.
-Standalone: no external dependencies.
+Items with nothing to show (no session name, no ports, no venv) are left out, and a
+health problem replaces the ✓ cluster with its own item: ▲ discord, ↑ 2.2.0, ~reload.
+Standalone: the standard library only, Python 3.10+.
 
 Usage numbers: Claude Code only pipes in the rate limits from *this* session's
 last reply, so they lag whenever other sessions (or claude.ai) use the shared
@@ -28,10 +29,11 @@ Install:
                "command": "python ~/.claude/statusline.py",
                "refreshInterval": 10
            }
-       (Swap "python" for "uv run" if you use uv.)
+       Add "--icons nerd" with a Nerd Font, STATUSLINE_THEME=light on a light terminal.
     3. Restart your Claude Code session.
 
-See https://github.com/roeimichael/claude-code-statusline for docs.
+`python statusline.py --demo` prints two sample lines at your window's width (nothing is
+read or written). See https://github.com/roeimichael/claude-code-statusline for docs.
 """
 
 import json
@@ -40,24 +42,59 @@ import re
 import sys
 import time
 import zlib
-from pathlib import Path
 
-# subprocess, socket and datetime are imported where they are used: a render with a
-# warm probe cache needs none of them, and it runs every second.
+# subprocess, socket, datetime and unicodedata are imported where they are used: a render
+# with a warm probe cache needs none of them, and it runs every second. pathlib is not
+# used at all: it costs ~4 ms of import per render.
 
 # ANSI colors (256-color palette, so macOS Terminal.app renders them too)
 def fg(n):
     return f"\033[38;5;{n}m"
 
 
-MODEL = fg(173)    # Claude orange
-PROJECT = fg(141)  # violet
-GREEN = fg(114)
-AMBER = fg(221)
-CYAN = fg(80)
-COST = "\033[1;38;5;46m"  # bold bright green
-# One color per model family, used for the model name and for subagents on that model.
-MODEL_COLORS = {"opus": fg(208), "sonnet": fg(75), "haiku": fg(43), "fable": fg(213)}
+RST = "\033[0m"
+
+# Two palettes of xterm-256 indices. The dark one is the default; STATUSLINE_THEME=light
+# picks colours with at least 3:1 contrast on a white background. Stage colours (green,
+# yellow, orange, red by percentage) are kept for the meters alone: no model family, effort
+# level or other text borrows one, so a stage colour always means a stage.
+THEMES = {
+    "dark": {
+        "DIM": 252,      # secondary text: the terminal's usual light grey, not a faint dim
+        "SEP": 240,      # the │ between items: dimmer than the labels
+        "TRACK": 238,    # the empty part of a bar
+        "STAGES": (114, 221, 208), "RED": 203,
+        "GREEN": 114, "AMBER": 221, "CYAN": 80,  # clean branch and ticks; dirty branch and updates; name, venv
+        "PROJECT": 141,  # violet
+        "MODEL": 173,    # Claude terracotta: Opus and unknown models
+        "ACCENT": 141,   # the max and xhigh effort levels
+        "MODEL_COLORS": {"opus": 173, "sonnet": 75, "haiku": 43, "fable": 213},
+    },
+    "light": {
+        "DIM": 244, "SEP": 250, "TRACK": 250,
+        "STAGES": (28, 136, 166), "RED": 160,
+        "GREEN": 28, "AMBER": 136, "CYAN": 30,
+        "PROJECT": 55, "MODEL": 130, "ACCENT": 55,
+        "MODEL_COLORS": {"opus": 130, "sonnet": 26, "haiku": 30, "fable": 127},
+    },
+}
+STAGE_LIMITS = (50, 70, 85)  # yellow from 50%, orange from 70%, red from 85%
+
+
+def set_theme(name):
+    """Install the named palette ('dark' unless name is 'light') into the colour globals."""
+    global DIM, SEP, BAR_TRACK, STAGES, RED, GREEN, AMBER, CYAN, PROJECT, MODEL, COST, MODEL_COLORS, EFFORT
+    t = THEMES.get(name) or THEMES["dark"]
+    DIM, RED, GREEN, AMBER, CYAN = fg(t["DIM"]), fg(t["RED"]), fg(t["GREEN"]), fg(t["AMBER"]), fg(t["CYAN"])
+    PROJECT, MODEL, COST = fg(t["PROJECT"]), fg(t["MODEL"]), fg(t["GREEN"])
+    STAGES = tuple(zip(STAGE_LIMITS, (fg(n) for n in t["STAGES"])))  # (below this %, colour), then RED
+    SEP = f" {fg(t['SEP'])}│{RST} "  # one space each side: room for three bars on one 120-column line
+    BAR_TRACK = fg(t["TRACK"])
+    MODEL_COLORS = {family: fg(n) for family, n in t["MODEL_COLORS"].items()}
+    EFFORT = {"low": DIM, "medium": DIM, "high": DIM, "xhigh": fg(t["ACCENT"]), "max": fg(t["ACCENT"])}
+
+
+set_theme("dark")
 
 
 def model_color(model_id):
@@ -66,20 +103,36 @@ def model_color(model_id):
         if family in m:
             return color
     return MODEL
-DIM = fg(252)  # secondary text: the terminal's usual light grey, not a faint dim
-RST = "\033[0m"
-RED = fg(203)
-# Meter colors by percentage: (below this %, color), then RED.
-STAGES = ((50, fg(114)), (70, fg(221)), (85, fg(208)))
 
-SEP = f" {DIM}│{RST} "  # one space each side: room for three bars on one 120-column line
+
 # Columns kept free at the window's right edge (Claude Code pads the status line).
 EDGE = 4
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
+ZERO_WIDTH = {0x200B, 0x200C, 0x200D, 0xFE0F}  # zero-width space/joiners, emoji variation selector
+
+
 def visible_width(s):
-    return len(ANSI_RE.sub("", s))
+    """Terminal cells the string takes: colour codes 0, East Asian wide and emoji 2, combining marks 0."""
+    s = ANSI_RE.sub("", s)
+    if s.isascii():
+        return len(s)
+    import unicodedata
+    width = 0
+    for i, c in enumerate(s):
+        o = ord(c)
+        if o < 0x300:
+            width += 1
+        elif o in ZERO_WIDTH or unicodedata.combining(c):
+            continue
+        elif unicodedata.east_asian_width(c) in "WF" or 0x1F300 <= o <= 0x1FAFF:
+            width += 2
+        elif 0x2600 <= o <= 0x27BF and s[i + 1:i + 2] == "️":
+            width += 2  # a symbol asked to render as an emoji
+        else:
+            width += 1
+    return width
 
 
 def mid_trunc(s, n):
@@ -91,16 +144,15 @@ def mid_trunc(s, n):
     keep = n - 1
     head = keep // 2
     return s[:head] + "…" + s[len(s) - (keep - head):]
-BAR = "\u2588"          # full block: fills the whole cell height
-BAR_TRACK = fg(238)      # the empty part of a bar
-EFFORT = {"low": DIM, "medium": GREEN, "high": AMBER, "xhigh": fg(209), "max": fg(203)}
+BAR = "\u2588"  # full block: fills the whole cell height
+# Bars fill by stage, so the bar and its colour always agree: a 5-cell bar shows 1 cell below
+# 25%, 2 below 50 (green never shows more than 2), 3 below 70, 4 below 85 and all 5 from 85
+# (red is always full); a 3-segment bar shows 1 while green, 2 while yellow or orange, 3 when
+# red. Only exactly 0 (or unknown) is empty.
+BAR_FILL = {5: (25, 50, 70, 85), 3: (50, 85)}
 
 # Health marks: MCP servers, Claude Code version and plugin reload state.
 SHOW_HEALTH = True
-# Extra line listing running subagents (model, effort, context tokens). Off by default:
-# the agent list under the prompt is the better place, see the companion mod. It is the
-# one way to get a second line.
-SHOW_AGENTS = False
 
 # Edit this list to match the dev ports you care about.
 COMMON_PORTS = [3000, 3001, 5173, 5174, 8000, 8080, 8081, 8086, 9086, 9087, 54321]
@@ -108,85 +160,132 @@ COMMON_PORTS = [3000, 3001, 5173, 5174, 8000, 8080, 8081, 8086, 9086, 9087, 5432
 # Live usage (the data /usage shows). Seconds between background fetches.
 USAGE_TTL = 60
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-USAGE_CACHE = CLAUDE_DIR / "statusline-usage.json"
-USAGE_LOCK = CLAUDE_DIR / "statusline-usage.lock"
+HOME = os.path.expanduser("~")  # USERPROFILE on Windows
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+USAGE_CACHE = os.path.join(CLAUDE_DIR, "statusline-usage.json")
+USAGE_LOCK = os.path.join(CLAUDE_DIR, "statusline-usage.lock")
 WINDOWS = ("five_hour", "seven_day")
 
 # Release check: newest Claude Code on your update channel. Seconds between fetches.
 RELEASE_TTL = 3600
 RELEASE_URL = "https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags"
-NATIVE_VERSIONS = Path.home() / ".local" / "share" / "claude" / "versions"
+NATIVE_VERSIONS = os.path.join(HOME, ".local", "share", "claude", "versions")
 
 # Icons. "none" uses plain text; "nerd" needs a Nerd Font in the terminal
 # (e.g. CaskaydiaMono Nerd Font). Pick with --icons nerd or STATUSLINE_ICONS=nerd.
 # Plain mode also serves the classic Windows console (Consolas), so only glyphs it has.
+# Icons only where they stand in for a label or a word, never next to one.
 PLAIN_ICONS = {"ok": "\u2713", "up": "\u2191", "warn": "\u25b2", "reload": "~"}
 NERD_ICONS = {
-    "model": "\U000F167A",    # md-robot_outline
-    "ctx": "\U000F0830",      # md-poker_chip (tokens)
     "five_hour": "\U000F051F",  # md-timer_sand
     "seven_day": "\U000F0A33",  # md-calendar_week
-    "cost": "\U000F01C1",     # md-currency_usd
-    "duration": "\U000F0150",  # md-clock_outline
-    "project": "\U000F024B",  # md-folder
-    "branch": "\ue725",       # dev-git_branch
+    "duration": "\U000F0150",  # md-clock_outline: replaces the word 'session'
     "venv": "\U000F0320",     # md-language_python
     "ports": "\U000F0318",    # md-lan_connect
-    "cc": "",           # cod-claude: the Claude logo
-    "plugins": "\U000F0431",  # md-puzzle
-    "skills": "\U000F140B",   # md-lightning_bolt
-    "mcp": "\U000F048D",      # md-server_network
-    "agents": "\U000F171A",   # md-robot_happy_outline
     "ok": "\U000F05E0",       # md-check_circle
     "up": "\U000F0CE1",       # md-arrow_up_circle
     "reload": "\U000F0453",   # md-reload
     "warn": "\U000F0026",     # md-alert
-    "tag": "\U000F04FC",      # md-tag_outline: the session name
+    "tag": "\U000F04FC",      # md-tag_outline: replaces the quotes round the session name
     "segment": "",  # powerline slants: one tilted full-height bar segment
 }
 ICON = dict(PLAIN_ICONS)
 
 
-def console_window_class():
-    """Window class of this process's console on Windows ('' when it has none), else None.
+CONSOLE_TTL = 3600  # a session's terminal never changes while it runs; its verdict is kept this long
 
-    The classic console host is 'ConsoleWindowClass'; Windows Terminal's ConPTY is
-    'PseudoConsoleWindow'.
+
+def console_host(chain, windows):
+    """'classic' (a conhost window), 'pty' (ConPTY: Windows Terminal, VS Code, ...) or None (no verdict).
+
+    chain: this process's ancestors, nearest first. windows: {pid: [(window class, visible)]},
+    the top-level windows those processes own. Windows attributes a console window to the
+    attached client process, not to conhost.exe, so the nearest ancestor owning a visible
+    console window decides: a classic window opened from a Windows Terminal shell has
+    cmd.exe [ConsoleWindowClass] nearer than pwsh.exe [PseudoConsoleWindow]. No such
+    window anywhere up the chain is not a verdict: Claude Code spawns the status line
+    without a console of its own, in Windows Terminal just as in the classic console.
     """
-    if os.name != "nt":
-        return None
-    if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
-        return None  # a terminal that says what it is: no need to pay for ctypes (~10 ms)
+    for pid in chain:
+        classes = {cls for cls, visible in windows.get(pid, ()) if visible}
+        if "ConsoleWindowClass" in classes:
+            return "classic"
+        if "PseudoConsoleWindow" in classes:
+            return "pty"
+    return None
+
+
+def _probe_console_host():
+    """console_host() for this process, asked of Windows through ctypes (~6 ms)."""
+    import ctypes
+    import ctypes.wintypes as w
+    k32, u32 = ctypes.windll.kernel32, ctypes.windll.user32
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [("dwSize", w.DWORD), ("cntUsage", w.DWORD), ("th32ProcessID", w.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)), ("th32ModuleID", w.DWORD),
+                    ("cntThreads", w.DWORD), ("th32ParentProcessID", w.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", w.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32.CreateToolhelp32Snapshot.restype = w.HANDLE
+    parents = {}
+    snapshot = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
     try:
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if not hwnd:
-            return ""
-        buf = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
-        return buf.value
-    except Exception:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(ProcessEntry)
+        more = k32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            parents[entry.th32ProcessID] = entry.th32ParentProcessID
+            more = k32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snapshot)
+    chain, pid = [], os.getpid()
+    while pid and pid in parents and len(chain) < 16:
+        chain.append(pid)
+        pid = parents[pid]
+    wanted, windows = set(chain), {}
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, w.HWND, w.LPARAM)
+    def visit(hwnd, _):
+        owner = w.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value in wanted:
+            buf = ctypes.create_unicode_buffer(64)
+            u32.GetClassNameW(hwnd, buf, 64)
+            windows.setdefault(owner.value, []).append((buf.value, bool(u32.IsWindowVisible(hwnd))))
+        return True
+
+    u32.EnumWindows(visit, 0)
+    return console_host(chain, windows)
+
+
+def terminal_kind(cache=None):
+    """console_host() for this Windows session, kept CONSOLE_TTL seconds per parent process; None elsewhere.
+
+    A terminal that announces itself (WT_SESSION, TERM_PROGRAM) is never asked about: the
+    answer would be 'keep nerd' and ctypes costs ~6 ms. Any failure is no verdict.
+    """
+    if os.name != "nt" or os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
         return None
 
+    def probe():
+        try:
+            return _probe_console_host()
+        except Exception:
+            return None
+    return _probe_cache(cache).get(f"console:{os.getppid()}", CONSOLE_TTL, probe)
 
-def effective_icons(mode):
+
+def effective_icons(mode, cache=None):
     """The requested icon set, unless this terminal cannot draw it.
 
     The classic Windows console shows Nerd Font glyphs as boxes (and miscounts their
-    width), so 'nerd' falls back to 'none' there. A console without a window counts
-    too, unless Windows Terminal (WT_SESSION) or another terminal (TERM_PROGRAM) set
-    its mark. STATUSLINE_FORCE_ICONS=1 skips the check. With WT_SESSION or TERM_PROGRAM
-    set, console_window_class() does not even ask Windows (the answer is 'keep nerd').
+    width), so 'nerd' falls back to 'none' there, and only there: no verdict keeps the
+    requested set. STATUSLINE_FORCE_ICONS=1 skips the check. cache: the render's ProbeCache.
     """
     if mode != "nerd" or os.environ.get("STATUSLINE_FORCE_ICONS"):
         return mode
-    cls = console_window_class()
-    if cls == "ConsoleWindowClass":
-        return "none"
-    if cls == "" and not os.environ.get("WT_SESSION") and not os.environ.get("TERM_PROGRAM"):
-        return "none"
-    return mode
+    return "none" if terminal_kind(cache) == "classic" else mode
 
 
 def set_icons(mode):
@@ -209,18 +308,17 @@ def color_pct(p):
 
 
 def bar(p, width=5, segments=3):
-    """A bar of `width` full blocks, or `segments` slanted segments with Nerd icons."""
+    """A bar of `width` full blocks, or `segments` slanted segments with Nerd icons, filled by stage (BAR_FILL)."""
     if ICON.get("segment"):
         seg, width = ICON["segment"], segments
     else:
         seg = BAR
-    # Any usage lights the first segment, so a low reading never looks empty.
-    filled = max(1 if p > 0 else 0, min(width, round(p / 100 * width)))
+    filled = 0 if p <= 0 else 1 + sum(p >= limit for limit in BAR_FILL[width])
     return f"{color_pct(p)}{seg * filled}{RST}{BAR_TRACK}{seg * (width - filled)}{RST}"
 
 
 def meter(label, p, icon, with_bar=True, suffix=""):
-    """'ctx 43% ▰▰▱ 430k/1M': label and value in the stage color, then bar and a light-grey suffix.
+    """'ctx 43% █████ 430k/1M': label and value in the stage colour, then the bar and a grey suffix.
 
     'ctx --' (no bar, no suffix) when the reading is unknown.
     """
@@ -248,18 +346,19 @@ def fmt_duration(ms):
     return f"{s}s"
 
 
-def fmt_until(seconds):
-    """Compact countdown: 14m, 3h, 3h05m, 5d, 5d2h."""
+RESET_FROM = 70  # a window shows when it resets only once it is this full
+
+
+def fmt_reset(seconds):
+    """Time until a window resets, as an arrow and one unit, at most four characters: →45m, →2h, →3d."""
     if seconds is None or seconds <= 0:
         return ""
     m = int(seconds // 60)
-    d, m = divmod(m, 1440)
-    h, m = divmod(m, 60)
-    if d:
-        return f"{d}d{h}h" if h else f"{d}d"
-    if h:
-        return f"{h}h{m:02d}m" if m else f"{h}h"
-    return f"{max(m, 1)}m"
+    if m >= 1440:
+        return f"→{m // 1440}d"
+    if m >= 60:
+        return f"→{m // 60}h"
+    return f"→{max(m, 1)}m"
 
 
 def fmt_tokens(n):
@@ -271,38 +370,53 @@ def fmt_tokens(n):
     return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
 
 
-def context_tokens(cw):
-    """'used/size' tokens in the context window, or '' when the size is unknown."""
-    size = cw.get("context_window_size")
+TOKEN_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _tokens_used(cw):
+    """Tokens in the context window right now, or None before the first reply (no counts at all)."""
     u = cw.get("current_usage")
-    if not size or not isinstance(u, dict):
-        return ""
-    keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-    if all(u.get(k) is None for k in keys):
-        return ""  # no reply yet: unknown, not "0 tokens"
-    used = sum(int(u.get(k) or 0) for k in keys)
-    return f"{fmt_tokens(used)}/{fmt_tokens(int(size))}"
-
-
-def context_pct(cw):
-    """Context window usage in percent, or None when Claude Code has not said."""
+    if not isinstance(u, dict) or all(u.get(k) is None for k in TOKEN_KEYS):
+        return None
     try:
-        return float(cw.get("used_percentage"))
+        return sum(int(u.get(k) or 0) for k in TOKEN_KEYS)
     except (TypeError, ValueError):
         return None
 
 
+def context_tokens(cw):
+    """'used/size' tokens in the context window, or '' when the size or the usage is unknown."""
+    size = cw.get("context_window_size")
+    used = _tokens_used(cw)
+    if not _number(size) or size <= 0 or used is None:
+        return ""
+    return f"{fmt_tokens(used)}/{fmt_tokens(int(size))}"
+
+
+def context_pct(cw):
+    """Context window usage in percent: Claude Code's figure, else worked out from the tokens.
+
+    A known window size with no usage yet is 0%; None only when the size is unknown too.
+    """
+    try:
+        return float(cw.get("used_percentage"))
+    except (TypeError, ValueError):
+        pass
+    size = cw.get("context_window_size")
+    if not _number(size) or size <= 0:
+        return None
+    return min(100.0, (_tokens_used(cw) or 0) / size * 100)
+
+
 def fmt_cost(c):
-    amount = f"{c:.2f}"
-    if ICON.get("cost"):
-        return f"{ic('cost', COST)}{COST}{amount}{RST}"
-    return f"{COST}${amount}{RST}"
+    return f"{COST}${c:.2f}{RST}"
 
 
 def run(cmd, timeout=1.0):
     import subprocess
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout)
         return r.stdout if r.returncode == 0 else ""
     except Exception:
         return ""
@@ -329,8 +443,10 @@ class ProbeCache:
     unwritable file only means the probes run again; it never breaks rendering.
     """
 
-    SKEW = 2      # seconds another session's clock reading may be ahead of ours
-    CLAIM_TTL = 5  # seconds before a claim left by a dead session is ignored
+    SKEW = 2          # seconds another session's clock reading may be ahead of ours
+    CLAIM_TTL = 5     # seconds before a claim left by a dead session is ignored
+    CLAIM_WAIT = 0.25  # seconds to wait for another session's probe of a key we have no value for
+    KEEP = 60         # seconds an entry stored without a TTL (put) stays in the file
 
     def __init__(self, path, now):
         self.path, self.now, self.dirty = path, now, False
@@ -341,7 +457,8 @@ class ProbeCache:
         if self.path is None:
             return {}
         try:
-            entries = json.loads(Path(self.path).read_text(encoding="utf-8"))
+            with open(self.path, encoding="utf-8") as f:
+                entries = json.load(f)
         except Exception:
             return {}
         return entries if isinstance(entries, dict) else {}
@@ -354,7 +471,7 @@ class ProbeCache:
         return None
 
     def _claim_path(self, key):
-        return Path(f"{self.path}.{zlib.crc32(key.encode('utf-8')):08x}.claim")
+        return f"{self.path}.{zlib.crc32(key.encode('utf-8')):08x}.claim"
 
     def _claim(self, key):
         """True when this session may recompute key now; False when another one already is."""
@@ -365,9 +482,9 @@ class ProbeCache:
                 return True
             except FileExistsError:
                 try:
-                    if time.time() - claim.stat().st_mtime < self.CLAIM_TTL:
+                    if time.time() - os.stat(claim).st_mtime < self.CLAIM_TTL:
                         return False
-                    claim.unlink()  # a session died mid-probe
+                    os.unlink(claim)  # a session died mid-probe
                 except OSError:
                     return False
             except OSError:
@@ -376,35 +493,56 @@ class ProbeCache:
 
     def _release(self, key):
         try:
-            self._claim_path(key).unlink()
+            os.unlink(self._claim_path(key))
         except OSError:
             pass
+
+    def _fresh(self, e, ttl):
+        at = self._at(e)
+        return at is not None and -self.SKEW <= self.now - at < ttl
 
     def get(self, key, ttl, compute):
         """The cached value for key while younger than ttl seconds, else compute() (and keep it).
 
-        When the entry has expired and another session is already recomputing it, the
-        stale value is returned instead, so concurrent sessions do not all probe at once.
+        Only one session recomputes a key at a time (a claim file). The others use the
+        expired value if they have one, or wait up to CLAIM_WAIT seconds for the result.
+        A session that wins the claim re-reads the file first: another one may have just
+        stored the value. A computed value is saved before the claim is released.
         """
         e = self.entries.get(key)
-        at = self._at(e)
-        stale = at is not None
-        if stale and -self.SKEW <= self.now - at < ttl:
+        if self._fresh(e, ttl):
             return e["v"]
         claimed = False
-        if stale and self.path is not None:
-            if not self._claim(key):
+        if self.path is not None:
+            claimed = self._claim(key)
+            if not claimed:
+                if self._at(e) is not None:
+                    return e["v"]  # stale, but another session is already on it
+                self._await_claim(key)
+            e = self._read().get(key)
+            if self._fresh(e, ttl):
+                if claimed:
+                    self._release(key)
+                self.entries[key] = e
                 return e["v"]
-            claimed = True
         try:
             value = compute()
+            self.entries[key] = {"at": self.now, "v": value, "ttl": ttl}
+            self.touched.add(key)
+            self.dirty = True
+            if claimed:
+                self.save()
         finally:
             if claimed:
                 self._release(key)
-        self.entries[key] = {"at": self.now, "v": value}
-        self.touched.add(key)
-        self.dirty = True
         return value
+
+    def _await_claim(self, key):
+        """Wait (briefly) for another session's claim on key to be released."""
+        claim = self._claim_path(key)
+        deadline = time.monotonic() + self.CLAIM_WAIT
+        while os.path.exists(claim) and time.monotonic() < deadline:
+            time.sleep(0.005)
 
     def peek(self, key):
         """A copy of the dict stored under key (even an expired one), or {}."""
@@ -427,13 +565,12 @@ class ProbeCache:
 
         Other sessions save to the same file, so this render's computed entries are laid
         over a fresh read (the newest `at` per key wins) instead of over the copy loaded
-        at the start. Entries no TTL can still use are dropped.
+        at the start. Entries past their own TTL (KEEP seconds when they have none) are dropped.
         """
         if self.path is None or not self.dirty:
             return
-        keep = max(GIT_TTL, PORTS_TTL, HEALTH_TTL, SKILLS_TTL)
-        tmp = Path(f"{self.path}.{os.getpid()}.tmp")
-        lock = Path(f"{self.path}.lock")
+        tmp = f"{self.path}.{os.getpid()}.tmp"
+        lock = f"{self.path}.lock"
         locked = self._lock(lock)  # without it (timeout, odd folder) the merge is just best effort
         try:
             merged = {k: e for k, e in self._read().items() if self._at(e) is not None}
@@ -441,8 +578,10 @@ class ProbeCache:
                 mine, theirs = self.entries[key], merged.get(key)
                 if theirs is None or theirs["at"] <= mine["at"]:
                     merged[key] = mine
-            entries = {k: e for k, e in merged.items() if -self.SKEW <= self.now - e["at"] < keep}
-            tmp.write_text(json.dumps(entries), encoding="utf-8")
+            entries = {k: e for k, e in merged.items()
+                       if -self.SKEW <= self.now - e["at"] < (e.get("ttl") if _number(e.get("ttl")) else self.KEEP)}
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(entries, f)
             for attempt in range(3):
                 try:
                     os.replace(tmp, self.path)
@@ -451,15 +590,17 @@ class ProbeCache:
                     if attempt == 2:
                         raise
                     time.sleep(0.005)
+            self.touched.clear()
+            self.dirty = False
         except Exception:
             try:
-                tmp.unlink()
+                os.unlink(tmp)
             except OSError:
                 pass
         finally:
             if locked:
                 try:
-                    lock.unlink()
+                    os.unlink(lock)
                 except OSError:
                     pass
 
@@ -472,8 +613,8 @@ class ProbeCache:
                 return True
             except FileExistsError:
                 try:
-                    if time.time() - lock.stat().st_mtime > 2:
-                        lock.unlink()  # left by a killed session
+                    if time.time() - os.stat(lock).st_mtime > 2:
+                        os.unlink(lock)  # left by a killed session
                         continue
                 except OSError:
                     pass
@@ -505,13 +646,17 @@ def _epoch(v):
 
 
 def _window(pct, resets_at, now):
-    if pct is None:
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        return None
+    if pct != pct:  # NaN
         return None
     reset = _epoch(resets_at)
     if reset is not None and reset <= now:
         # The window rolled over; this reading says nothing about the new one.
         return None
-    return {"pct": float(pct), "resets_at": reset}
+    return {"pct": pct, "resets_at": reset}
 
 
 def merge_usage(stdin_rl, live, now):
@@ -525,8 +670,10 @@ def merge_usage(stdin_rl, live, now):
     live = live or {}
     out = {}
     for key in WINDOWS:
-        s = stdin_rl.get(key) or {}
-        l = live.get(key) or {}
+        s = stdin_rl.get(key)
+        s = s if isinstance(s, dict) else {}
+        l = live.get(key)
+        l = l if isinstance(l, dict) else {}
         cands = [
             w for w in (
                 _window(s.get("used_percentage"), s.get("resets_at"), now),
@@ -545,20 +692,22 @@ def merge_usage(stdin_rl, live, now):
 
 def read_oauth_token():
     """The Claude subscription token, or None (API-key users, expired, unreadable)."""
-    raw = None
     try:
-        raw = (CLAUDE_DIR / ".credentials.json").read_text(encoding="utf-8")
-    except OSError:
-        if sys.platform == "darwin":
+        try:
+            with open(os.path.join(CLAUDE_DIR, ".credentials.json"), encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            if sys.platform != "darwin":
+                return None
             raw = run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"], 2.0)
-    try:
         oauth = json.loads(raw)["claudeAiOauth"]
-    except Exception:
+        expires = oauth.get("expiresAt")
+        if expires and float(expires) / 1000 <= time.time():
+            return None  # Claude Code refreshes it on its next request.
+        token = oauth.get("accessToken")
+        return token if isinstance(token, str) and token else None
+    except Exception:  # no file, bad JSON, null oauth block, odd types: anything means "no token"
         return None
-    expires = oauth.get("expiresAt")
-    if expires and expires / 1000 <= time.time():
-        return None  # Claude Code refreshes it on its next request.
-    return oauth.get("accessToken")
 
 
 def _number(v):
@@ -593,7 +742,8 @@ def _clean_usage_cache(raw):
 def load_usage_cache():
     """The usage cache as a dict of well-shaped values; {} when missing, corrupt or the wrong type."""
     try:
-        return _clean_usage_cache(json.loads(USAGE_CACHE.read_text(encoding="utf-8")))
+        with open(USAGE_CACHE, encoding="utf-8") as f:
+            return _clean_usage_cache(json.load(f))
     except Exception:
         return {}
 
@@ -612,8 +762,9 @@ def refresh_cache():
                 cache["tags"] = json.loads(r.read())
         except Exception:
             pass
-    tmp = USAGE_CACHE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache), encoding="utf-8")
+    tmp = f"{USAGE_CACHE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
     os.replace(tmp, USAGE_CACHE)
 
 
@@ -638,33 +789,48 @@ def _fetch_usage(cache, now):
         cache["error"] = f"{type(e).__name__}: {e}"[:200]
 
 
+LOCK_STALE = 30  # seconds after which a usage lock counts as left behind by a killed refresh
+
+
 def _take_lock(now, token=""):
-    """Create the usage lock holding `token` (who owns it); False when a fresh one exists."""
-    for _ in range(2):
-        try:
-            fd = os.open(USAGE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, token.encode("utf-8"))
-            finally:
-                os.close(fd)
-            return True
-        except FileExistsError:
-            try:
-                if now - USAGE_LOCK.stat().st_mtime < 30:
-                    return False  # a refresh is already running
-                USAGE_LOCK.unlink()  # left behind by a killed refresh
-            except OSError:
-                return False
-        except OSError:
-            return False
-    return False
+    """Create the usage lock holding `token` (who owns it); False when a fresh one exists.
+
+    A stale lock is taken over by moving it aside first: only one of several sessions can
+    win that rename, so the others see it fail and give up without touching the new lock.
+    """
+    try:
+        return _make_lock(token)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        if now - os.stat(USAGE_LOCK).st_mtime < LOCK_STALE:
+            return False  # a refresh is already running
+        aside = f"{USAGE_LOCK}.{os.getpid()}.stale"
+        os.replace(USAGE_LOCK, aside)  # FileNotFoundError: another session took it over first
+        os.unlink(aside)
+        return _make_lock(token)  # FileExistsError: someone else won the race after all
+    except OSError:
+        return False
+
+
+def _make_lock(token):
+    fd = os.open(USAGE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        os.write(fd, token.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
 
 
 def _release_lock(token):
     """Remove the usage lock, but only if it still holds our token (it may be someone else's by now)."""
     try:
-        if token and USAGE_LOCK.read_text(encoding="utf-8") == token:
-            USAGE_LOCK.unlink()
+        with open(USAGE_LOCK, encoding="utf-8") as f:
+            mine = token and f.read() == token
+        if mine:
+            os.unlink(USAGE_LOCK)
     except OSError:
         pass
 
@@ -700,7 +866,7 @@ def maybe_refresh(cache, now):
     else:
         kw["start_new_session"] = True
     try:
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--refresh", "--lock-token", token], **kw)
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--lock-token", token], **kw)
     except Exception:
         _release_lock(token)
 
@@ -728,14 +894,15 @@ def version_status(running, installed, published):
 
 def installed_versions():
     try:
-        return [d.name for d in NATIVE_VERSIONS.iterdir() if _ver(d.name)]
+        return [name for name in os.listdir(NATIVE_VERSIONS) if _ver(name)]
     except OSError:
         return []
 
 
 def _read_json(path):
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return {}
 
@@ -810,15 +977,6 @@ def _first_timestamp(raw):
     return None
 
 
-def session_started_at(transcript_path):
-    """The session's first transcript entry, as epoch seconds."""
-    try:
-        with open(transcript_path, "rb") as f:
-            return _first_timestamp(f.read(65536))
-    except (OSError, TypeError):
-        return None
-
-
 def mcp_status(logs, session_id, known_plugins=()):
     """(connected, failed) server names from this session's MCP log events.
 
@@ -830,10 +988,9 @@ def mcp_status(logs, session_id, known_plugins=()):
         state = None
         for e in sorted((e for e in events if e.get("sessionId") == session_id),
                         key=lambda e: e.get("timestamp", "")):
-            if "Successfully connected" in str(e.get("debug", "")):
-                state = True
-            elif str(e.get("error", "")).startswith("Connection failed"):
-                state = False
+            connected = _connection_state(e)
+            if connected is not None:
+                state = connected
         if state is None:
             continue
         (ok if state else failed).append(_mcp_name(server, known_plugins))
@@ -862,43 +1019,66 @@ def mcp_log_root(project_dir):
     """Claude Code's per-project cache dir, where it writes mcp-logs-<server>/."""
     if not project_dir:
         return None
-    key = "".join(c if c.isalnum() else "-" for c in str(project_dir))
+    # Claude Code's own rule: ASCII letters and digits stay, every other character becomes '-'.
+    key = "".join(c if (c.isascii() and c.isalnum()) else "-" for c in str(project_dir))
     if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "claude-cli-nodejs" / "Cache"
+        base = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local"),
+                            "claude-cli-nodejs", "Cache")
     elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches" / "claude-cli-nodejs"
+        base = os.path.join(HOME, "Library", "Caches", "claude-cli-nodejs")
     else:
-        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "claude-cli-nodejs"
-    return base / key
+        base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "claude-cli-nodejs")
+    return os.path.join(base, key)
 
 
-def read_mcp_logs(root, since=None, max_files=30):
-    """{server: [events]} from log files written since `since`, or None when there are no logs.
+def read_mcp_logs(root, max_files=30):
+    """{server: [connection events]} from the newest `max_files` log files per server, or None without logs.
 
-    Every session in a project shares these folders, so the newest files are
-    often another session's; read all the recent ones and let mcp_status pick.
+    Every session in a project shares these folders, so the newest files are often another
+    session's: the scan is shared between sessions through the probe cache and mcp_status
+    picks a session's own events. Only connection events are kept (they are all it reads),
+    so the cached scan stays small.
     """
+    if not root:
+        return None  # (os.listdir(None) would list the current directory)
     try:
-        dirs = [d for d in root.iterdir() if d.name.startswith("mcp-logs-")]
-    except (OSError, AttributeError):
+        dirs = [d for d in os.listdir(root) if d.startswith("mcp-logs-")]
+    except OSError:
         return None
     logs = {}
     for d in dirs:
         events = []
-        for f in sorted(d.glob("*.jsonl"), reverse=True)[:max_files]:
+        folder = os.path.join(root, d)
+        try:
+            files = sorted((f for f in os.listdir(folder) if f.endswith(".jsonl")), reverse=True)
+        except OSError:
+            files = []
+        for name in files[:max_files]:
             try:
-                if since is not None and f.stat().st_mtime < since:
-                    continue
-                text = f.read_text(encoding="utf-8", errors="replace")
+                with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                    text = f.read()
             except OSError:
                 continue
             for line in text.splitlines():
+                if "Successfully connected" not in line and "Connection failed" not in line:
+                    continue
                 try:
-                    events.append(json.loads(line))
+                    e = json.loads(line)
                 except ValueError:
-                    pass
-        logs[d.name[9:]] = events
+                    continue
+                if isinstance(e, dict) and _connection_state(e) is not None:
+                    events.append({k: e.get(k) for k in ("sessionId", "timestamp", "debug", "error") if k in e})
+        logs[d[9:]] = events
     return logs
+
+
+def _connection_state(e):
+    """True for a 'connected' event, False for a 'connection failed' one, else None."""
+    if "Successfully connected" in str(e.get("debug", "")):
+        return True
+    if str(e.get("error", "")).startswith("Connection failed"):
+        return False
+    return None
 
 
 def count_skills(installed, enabled, claude_dir, project_dir=None):
@@ -912,51 +1092,74 @@ def count_skills(installed, enabled, claude_dir, project_dir=None):
     for name, entries in (installed.get("plugins") or {}).items():
         if name not in enabled or not entries:
             continue
-        root = Path(entries[-1].get("installPath") or "")
-        listed = _read_json(root / ".claude-plugin" / "plugin.json").get("skills")
+        root = entries[-1].get("installPath")
+        if not root:
+            continue  # nothing on disk to count (and never the current directory)
+        listed = _read_json(os.path.join(root, ".claude-plugin", "plugin.json")).get("skills")
         if isinstance(listed, list):
-            n += sum(1 for rel in listed if (root / rel / "SKILL.md").exists())
+            n += sum(1 for rel in listed if os.path.isfile(os.path.join(root, str(rel), "SKILL.md")))
         else:
-            n += len(list(root.glob("skills/*/SKILL.md")))
-        n += len(list(root.glob("commands/*.md")))
-    n += len(list(Path(claude_dir).glob("skills/*/SKILL.md")))
+            n += _count_skill_files(os.path.join(root, "skills"))
+        n += _count_files(os.path.join(root, "commands"), ".md")
+    n += _count_skill_files(os.path.join(claude_dir, "skills"))
     if project_dir:
-        n += len(list(Path(project_dir).glob(".claude/skills/*/SKILL.md")))
+        n += _count_skill_files(os.path.join(project_dir, ".claude", "skills"))
     return n
 
 
-def health_marks(running, version, reload_plugins, mcp):
-    """Health marks as [(text, level)] in line order: MCP servers, Claude Code, plugins.
+def _count_skill_files(folder):
+    """How many <folder>/*/SKILL.md exist."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    return sum(1 for name in names if os.path.isfile(os.path.join(folder, name, "SKILL.md")))
 
-    Level 0 is healthy (a green check), 1 needs attention (amber), 2 is a failure (red).
-    A mark that needs attention says so by name: '▲ Gmail failed', '↑ 2.2 available',
-    '~ reload'. Marks without data (no logs, no version, no plugin list) are left out.
+
+def _count_files(folder, suffix):
+    try:
+        return sum(1 for name in os.listdir(folder) if name.endswith(suffix)
+                   and os.path.isfile(os.path.join(folder, name)))
+    except OSError:
+        return 0
+
+
+# Health mark levels, worst last. A problem's level picks the bare marker's glyph and colour.
+OK, RELOAD, UPDATE, FAILED = 0, 1, 2, 3
+MARKER = {FAILED: ("RED", "warn"), UPDATE: ("AMBER", "up"), RELOAD: ("DIM", "reload")}
+
+
+def health_marks(running, version, reload_plugins, mcp):
+    """Health as [(text, level, word)]: one '✓ mcp 3 · 2.1.296' cluster, or one item per problem.
+
+    All well: a green tick, then in grey what it vouches for (connected MCP servers, the
+    running version). Otherwise each problem is its own item, by name: '▲ discord' (red,
+    '+N' for more), '↑ 2.2.0' (amber: the version available) or '↑ restart' (installed, needs
+    a restart), '~reload' (grey: enabled plugins changed on disk, advice rather than a fault).
+    `word` is the one-word reason the bare marker carries when it has room. Nothing known
+    (no logs, no version, no plugin list) means no marks.
     """
+    ok, failed = mcp if mcp is not None else ([], [])
+    state, newer = version
     marks = []
-    if mcp is not None:
-        ok, failed = mcp
-        if failed:
-            more = f" +{len(failed) - 1}" if len(failed) > 1 else ""
-            marks.append((f"{RED}{ICON['warn']} {mid_trunc(failed[0], 12)}{more} failed{RST}", 2))
-        elif ok:
-            marks.append((f"{ic('mcp')}{DIM}mcp{RST} {len(ok)} {GREEN}{ICON['ok']}{RST}", 0))
-    if running:
-        state, newer = version
-        cc = f"{ic('cc', MODEL)}{DIM}CC{RST} {running}"  # logo in Claude orange
-        if state == "ok":
-            marks.append((f"{cc} {GREEN}{ICON['ok']}{RST}", 0))
-        elif state == "restart":  # newer build already downloaded; this window still runs the old one
-            marks.append((f"{AMBER}{ICON['up']} restart{f' for {newer}' if newer else ''}{RST}", 1))
-        elif state == "update":
-            marks.append((f"{AMBER}{ICON['up']} {f'{newer} available' if newer else 'update'}{RST}", 1))
-        else:
-            marks.append((cc, 0))
-    if reload_plugins is not None:
-        if reload_plugins:
-            marks.append((f"{AMBER}{ICON['reload']} reload{RST}", 1))
-        else:
-            marks.append((f"{ic('plugins')}{DIM}plugins{RST} {GREEN}{ICON['ok']}{RST}", 0))
-    return marks
+    if failed:
+        more = f" +{len(failed) - 1}" if len(failed) > 1 else ""
+        marks.append((f"{RED}{ICON['warn']} {mid_trunc(failed[0], 12)}{more}{RST}", FAILED, failed[0]))
+    if running and state == "restart":  # a newer build is installed; this window still runs the old one
+        marks.append((f"{AMBER}{ICON['up']} restart{RST}", UPDATE, "restart"))
+    elif running and state == "update":
+        marks.append((f"{AMBER}{ICON['up']} {newer or 'update'}{RST}", UPDATE, newer or "update"))
+    if reload_plugins:
+        gap = " " if ICON["reload"] != "~" else ""
+        marks.append((f"{DIM}{ICON['reload']}{gap}reload{RST}", RELOAD, "reload"))
+    if marks:
+        return marks
+    parts = ([f"mcp {len(ok)}"] if ok else []) + ([str(running)] if running else [])
+    if not parts:
+        return []
+    verified = bool(ok) or state == "ok" or reload_plugins == []
+    tick = f"{GREEN}{ICON['ok']}{RST} " if verified else ""
+    return [(f"{tick}{DIM}{' · '.join(parts)}{RST}", OK, "")]
 
 
 def health_state(data, cache=None):
@@ -980,8 +1183,8 @@ def health_state(data, cache=None):
 
 
 def _settings_and_plugins():
-    return (_read_json(CLAUDE_DIR / "settings.json"),
-            _read_json(CLAUDE_DIR / "plugins" / "installed_plugins.json"))
+    return (_read_json(os.path.join(CLAUDE_DIR, "settings.json")),
+            _read_json(os.path.join(CLAUDE_DIR, "plugins", "installed_plugins.json")))
 
 
 def _enabled(settings):
@@ -1009,112 +1212,12 @@ def _health_probe(data, cache=None):
         reload_plugins = plugins_needing_reload(installed, _enabled(settings), loaded_at)
 
     ws = data.get("workspace") or {}
-    started = session_started_at(data.get("transcript_path"))
-    logs = read_mcp_logs(mcp_log_root(ws.get("project_dir") or data.get("cwd")),
-                         since=started - 60 if started else None)
+    # One scan per project, shared by its sessions (they all read the same folders).
+    root = mcp_log_root(ws.get("project_dir") or data.get("cwd"))
+    logs = cache.get("mcplogs:" + json.dumps(root), HEALTH_TTL, lambda: read_mcp_logs(root))
     known = {k.split("@")[0] for k in (installed.get("plugins") or {})}
     mcp = mcp_status(logs, data.get("session_id"), known) if logs else None
     return [version, reload_plugins, mcp]
-
-
-# --- subagents -----------------------------------------------------------------
-
-SUBAGENT_STALE = 600  # seconds without a write before a subagent counts as gone
-SUBAGENTS_SHOWN = 3
-
-
-def fmt_model_id(model_id):
-    """claude-haiku-5-5 -> Haiku 5.5; unknown ids pass through."""
-    m = str(model_id or "").split("[")[0]
-    parts = m.split("-")
-    if len(parts) >= 3 and parts[0] == "claude" and all(x.isdigit() for x in parts[2:]):
-        return f"{parts[1].capitalize()} {'.'.join(parts[2:])}"
-    return m
-
-
-def subagent_state(entries):
-    """Model, effort, context tokens and running flag from a subagent's transcript entries."""
-    state = {"model": None, "effort": None, "tokens": 0, "running": True}
-    last = None
-    for e in entries:
-        if e.get("type") not in ("user", "assistant"):
-            continue
-        last = e
-        if e["type"] != "assistant":
-            continue
-        msg = e.get("message") or {}
-        state["model"] = msg.get("model") or state["model"]
-        state["effort"] = e.get("effort") or state["effort"]
-        u = msg.get("usage") or {}
-        state["tokens"] = sum(int(u.get(k) or 0) for k in
-                              ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-    if last and last["type"] == "assistant" and (last.get("message") or {}).get("stop_reason") == "end_turn":
-        state["running"] = False
-    return state
-
-
-def _tail_entries(path, max_bytes=262_144):
-    """Parsed JSON lines from the end of a transcript (the first, maybe partial, line is dropped)."""
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        f.seek(max(0, size - max_bytes))
-        raw = f.read()
-    lines = raw.split(b"\n")
-    if size > max_bytes:
-        lines = lines[1:]
-    out = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            pass
-    return out
-
-
-def running_subagents(transcript_path, now):
-    """Subagents of this session that are still working, newest first."""
-    if not transcript_path:
-        return []
-    d = Path(str(transcript_path)[:-6] if str(transcript_path).endswith(".jsonl") else transcript_path) / "subagents"
-    try:
-        files = [(f.stat().st_mtime, f) for f in d.glob("agent-*.jsonl")]
-    except OSError:
-        return []
-    agents = []
-    for mtime, f in sorted(files, reverse=True):
-        if now - mtime > SUBAGENT_STALE:
-            continue
-        try:
-            state = subagent_state(_tail_entries(f))
-        except OSError:
-            continue
-        if not state["running"]:
-            continue
-        meta = _read_json(f.with_name(f.name[:-6] + ".meta.json"))
-        state["type"] = meta.get("agentType") or f.stem[6:]
-        agents.append(state)
-    return agents
-
-
-def format_agents(agents):
-    """Third line, shown only while subagents run."""
-    if not agents:
-        return ""
-    parts = [f"{ic('agents')}{DIM}agents{RST} {len(agents)}"]
-    for a in agents[:SUBAGENTS_SHOWN]:
-        c = model_color(a.get("model"))
-        s = f"{c}{a['type']}{RST}"
-        if a.get("model"):
-            s += f" {c}{fmt_model_id(a['model'])}{RST}"
-        if a.get("effort"):
-            s += f" {DIM}\u00b7{RST} {EFFORT.get(a['effort'], '')}{a['effort']}{RST}"
-        if a.get("tokens"):
-            s += f" {DIM}{fmt_tokens(a['tokens'])}{RST}"
-        parts.append(s)
-    if len(agents) > SUBAGENTS_SHOWN:
-        parts.append(f"{DIM}+{len(agents) - SUBAGENTS_SHOWN}{RST}")
-    return SEP.join(parts)
 
 
 # --- workspace probes --------------------------------------------------------
@@ -1124,7 +1227,7 @@ def git_info(cwd, cache=None):
 
     cache: the render's ProbeCache; git status is kept GIT_TTL seconds per directory.
     """
-    if not cwd or not Path(cwd).exists():
+    if not cwd or not os.path.exists(cwd):
         return ""
     status = _probe_cache(cache).get("git:" + str(cwd), GIT_TTL, lambda: git_status(cwd))
     if not status:
@@ -1165,37 +1268,48 @@ def git_status(cwd):
     return [branch, stg, mod, unt]
 
 
-MIN_NAME = 14      # a shortened project or branch name keeps at least this many characters
+MIN_NAME = 14      # a shortened project name keeps at least this many characters
 SHORT_BRANCH = 11  # a tight line shows 'live-usage…': this many characters, then the ellipsis
+BRANCH_MIN = 8     # the shortest cut branch, ellipsis included: 'live-us…'
 
 
 def _where_text(proj, branch, flags):
     parts = []
     if proj:
-        parts.append(f"{ic('project', PROJECT)}{PROJECT}{proj}{RST}")
+        parts.append(f"{PROJECT}{proj}{RST}")
     if branch:
         color = AMBER if flags else GREEN
-        parts.append(" ".join([f"{ic('branch', color)}{color}{branch}{RST}"] + list(flags)))
+        parts.append(" ".join([f"{color}{branch}{RST}"] + list(flags)))
     return f" {DIM}›{RST} ".join(parts)
 
 
 def shrink_where(proj, branch, flags, width):
-    """(project, branch) with the longer one losing characters from its middle
-    ('claude-co…statusline') until 'project › branch flags' fits `width`. Neither
-    goes below MIN_NAME characters. width None: unchanged."""
-    p_len, b_len = len(proj), len(branch)
-    p, b = proj, branch
-    while width and visible_width(_where_text(p, b, flags)) > width:
-        if b_len >= p_len and b_len > MIN_NAME:
-            b_len -= 1
-        elif p_len > MIN_NAME:
-            p_len -= 1
-        elif b_len > MIN_NAME:
-            b_len -= 1
-        else:
-            break  # as short as it gets
-        p, b = mid_trunc(proj, p_len), mid_trunc(branch, b_len)
-    return p, b
+    """(project, branch) made to fit `width` as 'project › branch flags'.
+
+    The project name is what tells windows apart, so it stays whole as long as it
+    can: the branch gives way first, cut from its end ('live-us…', never below
+    BRANCH_MIN), then dropped with its counts; only then the project loses
+    characters from its middle ('claude-co…statusline'), never below MIN_NAME.
+    width None: unchanged."""
+    if not width:
+        return proj, branch
+
+    def fits(p, b):
+        return visible_width(_where_text(p, b, flags if b else [])) <= width
+
+    b = branch
+    n = len(branch)
+    while n > BRANCH_MIN and not fits(proj, b):
+        n -= 1
+        b = branch[:n - 1] + "…"
+    if fits(proj, b):
+        return proj, b
+    p = proj
+    m = len(proj)
+    while m > MIN_NAME and not fits(p, ""):
+        m -= 1
+        p = mid_trunc(proj, m)
+    return p, ""
 
 
 def where_item(proj, git, width=None):
@@ -1297,12 +1411,12 @@ def session_name(data, cache=None):
 
 
 def line_width():
-    """Columns available to the status line, or None when the window width is unknown."""
+    """Columns available to the status line (COLUMNS minus the edge, at least 20), or None when unknown."""
     try:
-        width = int(os.environ.get("COLUMNS") or 0) - EDGE
+        columns = int(os.environ.get("COLUMNS") or 0)
     except ValueError:
         return None
-    return width if width > 20 else None
+    return max(columns - EDGE, 20) if columns > 0 else None
 
 
 def venv_tag():
@@ -1311,8 +1425,13 @@ def venv_tag():
         return f"{ic('venv', CYAN)}{DIM}env:{RST}{CYAN}{conda}{RST}"
     venv = os.environ.get("VIRTUAL_ENV")
     if venv:
-        return f"{ic('venv', CYAN)}{DIM}venv:{RST}{CYAN}{Path(venv).name}{RST}"
+        return f"{ic('venv', CYAN)}{DIM}venv:{RST}{CYAN}{_basename(venv)}{RST}"
     return ""
+
+
+def _basename(path):
+    """The last component of a path, ignoring a trailing separator ('/x/.venv/' -> '.venv')."""
+    return os.path.basename(os.path.normpath(path))
 
 
 def open_ports(ports=None, timeout=0.02):
@@ -1363,14 +1482,18 @@ def ports_tag(cache=None):
 
 # --- layout ------------------------------------------------------------------
 
-def model_head(data):
+MODEL_MAX = 20   # a longer display name loses its middle: 'Claude Opus…view Build'
+MODEL_SHORT = 8  # on a tiny window the name is cut harder, after everything else has gone
+
+
+def model_head(data, name_max=MODEL_MAX, effort=True):
     """'Opus 5.5 · high' in the model family's color and the effort's color."""
     model = data.get("model", {}) or {}
-    name = model.get("display_name", "Claude")
+    name = str(model.get("display_name") or "Claude")
     mc = model_color(model.get("id") or name)
-    head = f"{ic('model', mc)}{mc}{name}{RST}"
+    head = f"{mc}{mid_trunc(name, name_max)}{RST}"
     level = (data.get("effort") or {}).get("level")
-    if level:
+    if level and effort:
         head += f" {DIM}·{RST} {EFFORT.get(level, '')}{level}{RST}"
     return head
 
@@ -1398,8 +1521,8 @@ def gather_extras(data, cache=None):
     """
     ws = data.get("workspace", {}) or {}
     cwd = ws.get("current_dir") or ws.get("project_dir") or data.get("cwd") or os.getcwd()
-    extras = {"proj": Path(cwd).name if cwd else "", "git": None, "name": "", "marks": [],
-              "skills": None, "ports": "", "venv": ""}
+    extras = {"proj": _basename(cwd) if cwd else "", "git": None, "name": "", "marks": [],
+              "skills": None, "ports": "", "venv": ""}  # marks: health_marks()'s list
     for key, probe in (("git", lambda: git_info(cwd, cache)),
                        ("name", lambda: session_name(data, cache)),
                        ("venv", venv_tag),
@@ -1418,6 +1541,9 @@ def gather_extras(data, cache=None):
     return extras
 
 
+MARKER_REASON_ROOM = 8  # free columns the bare marker needs before it adds its one-word reason
+
+
 def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, width=None):
     """The status line: ONE line, never wider than `width` columns (None: no limit).
 
@@ -1425,48 +1551,53 @@ def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, 
     result; without it only the session's own items show. Left to right:
 
         project › branch ~N “session-name” │ model · effort │ ctx % bar tokens │
-        5h % bar reset │ 7d % bar reset │ cost │ session time │ health marks │
+        5h % bar →reset │ 7d % bar →reset │ $cost │ session time │ health │
         skills │ venv │ :ports
 
-    The line is made for a 120-column window. When it does not fit `width`, things go in
-    this order, each only if the line is still too wide:
+    A window's →reset countdown shows only from RESET_FROM percent and belongs to its meter:
+    it is never dropped on its own. The line is made for a 120-column window. When it does
+    not fit `width`, things go in this order, each only if the line is still too wide:
 
-      1. venv and ports, 2. skills, 3. the 5h/7d reset countdowns, 4. session time,
-      5. healthy health marks, last one first (plugins, then CC, then mcp),
-      6. marks that need attention, last one first, each shown by name ('▲ Gmail failed'); when
-         the last text goes, one bare marker (▲, red for a failure, else amber) stands in for
-         all of them, and it outlasts everything below except model and percentages,
-      7. the session name,
-      8. the branch: first project and branch are squeezed into the room left (the longer
+      1. venv and ports, 2. skills, 3. session time,
+      4. the healthy health cluster ('✓ mcp 3 · 2.1.296'),
+      5. health problems, last one first, each by name ('▲ discord', '↑ 2.2.0', '~reload'); when
+         the last text goes, one bare marker stands in for all of them, with the glyph and colour
+         of the worst (▲ red, then ↑ amber, then ~ grey) and, given MARKER_REASON_ROOM free
+         columns, its one-word reason ('▲discord'); it outlasts everything below except model
+         and percentages,
+      6. the session name,
+      7. the branch: first project and branch are squeezed into the room left (the longer
          loses characters from its middle, neither below 14), then the branch is cut to
-         'live-usage…', then dropped (with its dirty counts),
-      9. the project: squeezed down to 14 characters as the room shrinks, then dropped,
-     10. the ctx tokens, 11. the bars (7d, then 5h, then ctx), 12. the cost, 13. the bare
-         marker.
+         'live-usage…', then its dirty counts go (it stays amber), then the branch itself,
+      8. the project: squeezed down to 14 characters as the room shrinks, then dropped,
+      9. the ctx tokens, 10. the bars (7d, then 5h, then ctx), 11. the cost, 12. the effort,
+     13. the model name is cut to 8 characters, 14. the bare marker.
 
-    Model and the three percentages always stay. Session time sits between the countdowns
-    and the health marks: it is cheap and the least useful of them.
+    Model and the three percentages always stay, with their countdowns: at 100% they need
+    47 columns ('Opus 5.5 │ ctx 100% │ 5h 100% →1h │ 7d 100% →3d'), the floor of the line.
     """
     now = time.time() if now is None else now
     cw = data.get("context_window", {}) or {}
     ex = extras or {}
 
-    meters = [("ctx", context_pct(cw), "ctx", context_tokens(cw))]
+    # (label, percentage, icon, suffix, suffix is droppable): the ctx tokens go, countdowns stay.
+    meters = [("ctx", context_pct(cw), "ctx", context_tokens(cw), True)]
     if show_usage:
         usage = usage or {}
         for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
             w = usage.get(key)
-            left = fmt_until(w["resets_at"] - now) if w and w["resets_at"] else ""
-            meters.append((label, w["pct"] if w else None, key, left))
-    head = model_head(data)
+            left = fmt_reset(w["resets_at"] - now) if w and w["resets_at"] and w["pct"] >= RESET_FROM else ""
+            meters.append((label, w["pct"] if w else None, key, left, False))
     cost = fmt_cost(float((data.get("cost", {}) or {}).get("total_cost_usd", 0.0) or 0.0))
     session = session_time(data)
     tag = name_tag(ex["name"]) if ex.get("name") else ""
-    skills = f"{ic('skills')}{DIM}skills{RST} {ex['skills']}" if ex.get("skills") else ""
+    skills = f"{DIM}skills{RST} {ex['skills']}" if ex.get("skills") else ""
     marks = list(ex.get("marks") or [])
-    marker = ""
-    if any(level for _, level in marks):
-        marker = f"{RED if any(level == 2 for _, level in marks) else AMBER}{ICON['warn']}{RST}"
+    worst = max(marks, key=lambda m: m[1], default=None)
+    marker = None
+    if worst and worst[1] > OK:
+        color_name, glyph = MARKER[worst[1]]
+        marker = (globals()[color_name], ICON[glyph], worst[2])
 
     proj = ex.get("proj") or ""
     branch, flags = ex.get("git") or ("", [])
@@ -1478,8 +1609,9 @@ def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, 
         p, b, f = proj, branch, flags
         if s["branch"] is None:
             b, f = "", []
-        elif s["branch"] == "short":
+        elif s["branch"] in ("short", "bare"):
             b = short_branch(b)
+            f = [] if s["branch"] == "bare" else f
         if s["branch"] != "full" and width:
             taken = visible_width(SEP.join(rest)) + visible_width(SEP)
             if s["name"] and tag:
@@ -1490,37 +1622,49 @@ def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, 
         return _where_text(p, b, f)
 
     def items(s):
-        out = [head]
-        for i, (label, p, icon, suffix) in enumerate(meters):
-            show = s["tokens"] if i == 0 else s["countdown"]
+        out = [model_head(data, MODEL_SHORT if s["model"] == "short" else MODEL_MAX, s["effort"])]
+        for i, (label, p, icon, suffix, droppable) in enumerate(meters):
+            show = s["tokens"] or not droppable
             out.append(meter(label, p, icon, with_bar=i < s["bars"], suffix=suffix if show else ""))
         if s["cost"]:
             out.append(cost)
         if s["session"] and session:
             out.append(session)
-        out += [text for i, (text, _) in enumerate(marks) if i not in s["dropped"]]
+        out += [text for i, (text, _, _) in enumerate(marks) if i not in s["dropped"]]
         if s["marker"] and marker:
-            out.append(marker)
+            color, glyph, _ = marker
+            out.append(f"{color}{glyph}{RST}")
         if s["skills"] and skills:
             out.append(skills)
         if s["extras"]:
             out += [x for x in (ex.get("venv"), ex.get("ports")) if x]
         first = " ".join(x for x in (where(s, out), tag if s["name"] else "") if x)
-        return [first] + out if first else out
+        line = [first] + out if first else out
+        if s["marker"] and marker and marker[2]:
+            # The bare marker says why when there is room: '▲discord'.
+            color, glyph, word = marker
+            # Nerd glyphs draw past their cell: a space keeps '󰀦 discord' from overlapping.
+            gap = " " if ICON.get("segment") else ""
+            free = MARKER_REASON_ROOM + len(word) if width is None else width - visible_width(SEP.join(line))
+            if free >= MARKER_REASON_ROOM:
+                line[line.index(f"{color}{glyph}{RST}")] = (
+                    f"{color}{glyph}{gap}{mid_trunc(word, free - len(gap))}{RST}")
+        return line
 
     # The drop order, as patches applied one after the other to the state.
-    steps = [{"extras": False}, {"skills": False}, {"countdown": False}, {"session": False}]
-    healthy = [i for i, (_, level) in enumerate(marks) if level == 0]
-    needy = [i for i, (_, level) in enumerate(marks) if level]
+    steps = [{"extras": False}, {"skills": False}, {"session": False}]
+    healthy = [i for i, (_, level, _) in enumerate(marks) if level == OK]
+    needy = [i for i, (_, level, _) in enumerate(marks) if level > OK]
     steps += [{"dropped": i} for i in reversed(healthy)]
     steps += [{"dropped": i, "marker": k == len(needy) - 1} for k, i in enumerate(reversed(needy))]
-    steps += [{"name": False}, {"branch": "fit"}, {"branch": "short"}, {"branch": None},
+    steps += [{"name": False}, {"branch": "fit"}, {"branch": "short"}, {"branch": "bare"}, {"branch": None},
               {"proj": None},
-              {"tokens": False}, {"bars": 2}, {"bars": 1}, {"bars": 0}, {"cost": False}, {"marker": False}]
+              {"tokens": False}, {"bars": 2}, {"bars": 1}, {"bars": 0}, {"cost": False},
+              {"effort": False}, {"model": "short"}, {"marker": False}]
 
-    state = {"extras": True, "skills": True, "countdown": True, "session": True, "dropped": set(),
+    state = {"extras": True, "skills": True, "session": True, "dropped": set(),
              "marker": False, "name": True, "branch": "full", "proj": "full", "tokens": True,
-             "bars": len(meters), "cost": True}
+             "bars": len(meters), "cost": True, "effort": True, "model": "full"}
     best = items(state)
     for step in [None] + steps:
         if step:
@@ -1534,10 +1678,39 @@ def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, 
     return SEP.join(best)
 
 
+# --- demo --------------------------------------------------------------------
+
+def demo_lines(now=None, width=None):
+    """Two realistic sample lines (a healthy session, then one with a failed MCP server and an
+    update) rendered at `width`, from fixed data: no probes, no caches, no network."""
+    now = time.time() if now is None else now
+    data = {"model": {"id": "claude-opus-4-6", "display_name": "Opus 4.6"}, "effort": {"level": "high"},
+            "context_window": {"used_percentage": 43, "context_window_size": 1_000_000,
+                               "current_usage": {"input_tokens": 2, "cache_creation_input_tokens": 787,
+                                                 "cache_read_input_tokens": 429_211}},
+            "cost": {"total_cost_usd": 103.21, "total_duration_ms": 5_580_000}}
+    usage = merge_usage({"five_hour": {"used_percentage": 74, "resets_at": now + 2 * 3600 + 600},
+                         "seven_day": {"used_percentage": 48, "resets_at": now + 5 * 86400}}, None, now)
+    extras = {"proj": "claude-code-statusline", "git": ("live-usage-and-redesign", [f"{AMBER}~2{RST}"]),
+              "name": "", "skills": 69, "ports": f"{ic('ports', GREEN)}{GREEN}:3000{RST}", "venv": "",
+              "marks": health_marks("2.1.296", ("ok", None), [], (["a", "b", "c"], []))}
+    healthy = format_statusline(data, usage, now, True, extras, width)
+    extras.update(name="statusline-py-usage-accuracy",
+                  marks=health_marks("2.1.296", ("update", "2.2.0"), [], (["a", "b"], ["discord"])))
+    troubled = format_statusline(data, usage, now, True, extras, width)
+    return healthy, troubled
+
+
+def _opt(args, name):
+    """The value after `name` in args ('--icons nerd' -> 'nerd'), or None."""
+    return args[args.index(name) + 1] if name in args[:-1] else None
+
+
 def main():
-    if "--refresh" in sys.argv:
+    args = sys.argv[1:]  # argv[0] is this file, or '-c' when main() is imported and called
+    if "--refresh" in args:
         # The spawning render created the lock and passed its token; a manual run takes its own.
-        token = sys.argv[sys.argv.index("--lock-token") + 1] if "--lock-token" in sys.argv[:-1] else None
+        token = _opt(args, "--lock-token")
         if token is None:
             token = f"{os.getpid()}-{time.time_ns()}"
             if not _take_lock(time.time(), token):
@@ -1548,21 +1721,25 @@ def main():
         finally:
             _release_lock(token)
         return
-    mode = os.environ.get("STATUSLINE_ICONS", "none")
-    if "--icons" in sys.argv[:-1]:
-        mode = sys.argv[sys.argv.index("--icons") + 1]
-    set_icons(effective_icons(mode))
+    mode = _opt(args, "--icons") or os.environ.get("STATUSLINE_ICONS", "none")
+    set_theme(os.environ.get("STATUSLINE_THEME", "dark"))
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+    if "--demo" in args:  # sample lines for a screenshot: no stdin, no probes, nothing written
+        set_icons(effective_icons(mode))
+        print("\n".join(demo_lines(width=line_width())))
+        sys.exit(0)
     try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
         now = time.time()
-        stdin_rl = data.get("rate_limits") or {}
+        probes = ProbeCache(os.path.join(CLAUDE_DIR, PROBE_CACHE_NAME), now)
+        set_icons(effective_icons(mode, probes))
+        raw = read_stdin()
+        data = json.loads(raw) if raw.strip() else {}
+        stdin_rl = data.get("rate_limits")
+        stdin_rl = stdin_rl if isinstance(stdin_rl, dict) else {}
         live = None
-        show_usage = True  # unknown windows read "5h --", never vanish
         if os.environ.get("STATUSLINE_LIVE_USAGE", "1") != "0":
             cache = load_usage_cache()
             live = cache.get("usage")
@@ -1573,22 +1750,25 @@ def main():
         except Exception:
             usage = merge_usage(stdin_rl, None, now)  # a bad cache must not hide the live numbers
         known = any(usage.values())
-        probes = ProbeCache(CLAUDE_DIR / PROBE_CACHE_NAME, now)
+        # The 5h/7d items show once either source has had the windows (as '--' when they have
+        # expired); a session that never had them (an API key, no live data yet) shows neither.
+        show_usage = known or bool(stdin_rl) or bool(live)
         # One line, fitted to the window; every slow probe sits behind the probe cache.
         line = format_statusline(data, usage if known else None, now, show_usage,
                                  gather_extras(data, probes), line_width())
-        if SHOW_AGENTS:
-            try:
-                agents = format_agents(running_subagents(data.get("transcript_path"), now))
-                if agents:
-                    line += "\n" + agents
-            except Exception:
-                pass
         print(line)
         probes.save()  # never raises
     except Exception:
         print("Claude | --")
     sys.exit(0)
+
+
+def read_stdin():
+    """The whole of stdin as text, decoded as UTF-8 whatever the console code page is."""
+    buf = getattr(sys.stdin, "buffer", None)
+    if buf is None:  # a text stream without bytes behind it (tests, odd hosts)
+        return sys.stdin.read()
+    return buf.read().decode("utf-8", "replace")
 
 
 if __name__ == "__main__":

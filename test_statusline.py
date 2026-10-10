@@ -103,15 +103,28 @@ class Render(unittest.TestCase):
             self.assertRegex(out, r"ctx 0% \S+ │ \$0.00$")
             self.assertNotIn("/200k", out)
 
-    def test_ctx_is_unknown_without_a_context_window_or_percentage(self):
+    def test_ctx_is_unknown_without_a_window_size_or_percentage(self):
         for data in ({}, {"context_window": None}, {"context_window": {}},
-                     {"context_window": {"context_window_size": 1_000_000, "current_usage": {}}},
-                     {"context_window": {"context_window_size": 1_000_000, "used_percentage": None}}):
+                     {"context_window": {"current_usage": {"input_tokens": 5}}},
+                     {"context_window": {"context_window_size": None, "used_percentage": None}}):
             out = plain(sl.format_statusline(data, now=NOW, show_usage=False))
             self.assertIn("ctx --", out, data)
             self.assertNotIn("0%", out, data)
             self.assertNotIn(sl.BAR, out, data)
             self.assertNotIn("/", out, data)
+
+    def test_ctx_is_zero_when_the_window_size_is_known_but_nothing_was_used_yet(self):
+        for cw in ({"context_window_size": 1_000_000, "current_usage": {}},
+                   {"context_window_size": 1_000_000, "used_percentage": None},
+                   {"context_window_size": 1_000_000}):
+            out = plain(sl.format_statusline({"context_window": cw}, now=NOW, show_usage=False))
+            self.assertIn("ctx 0%", out, cw)
+            self.assertNotIn("/1M", out, cw)
+        # tokens without a percentage: the percentage is worked out from them
+        cw = {"context_window_size": 200_000, "current_usage": {"input_tokens": 50_000}}
+        out = plain(sl.format_statusline({"context_window": cw}, now=NOW, show_usage=False))
+        self.assertIn("ctx 25%", out)
+        self.assertIn("50k/200k", out)
 
     def test_ctx_with_a_window_but_no_usage_has_a_percentage_and_no_tokens(self):
         cw = {"context_window_size": 1_000_000, "used_percentage": 14, "current_usage": None}
@@ -129,10 +142,11 @@ class Render(unittest.TestCase):
         self.assertIn("session 1h33m", out)
         self.assertEqual(plain(sl.session_time({"cost": {"total_duration_ms": 0}})), "")
 
-    def test_countdown_drops_zero_parts(self):
-        self.assertEqual([sl.fmt_until(s) for s in (5 * 24 * HOUR, 5 * 24 * HOUR + 2 * HOUR, 3 * HOUR,
-                                                    3 * HOUR + 5 * 60, 14 * 60)],
-                         ["5d", "5d2h", "3h", "3h05m", "14m"])
+    def test_reset_countdown_is_an_arrow_and_at_most_four_characters(self):
+        cases = {5 * 24 * HOUR: "→5d", 5 * 24 * HOUR + 2 * HOUR: "→5d", 3 * HOUR: "→3h", 3 * HOUR + 5 * 60: "→3h",
+                 2 * HOUR + 10 * 60: "→2h", 45 * 60: "→45m", 30: "→1m", 0: "", None: ""}
+        self.assertEqual({s: sl.fmt_reset(s) for s in cases}, cases)
+        self.assertTrue(all(len(v) <= 4 for v in cases.values()))
 
     def test_cost_always_has_two_decimals(self):
         self.assertEqual([plain(sl.fmt_cost(c)) for c in (47.5, 0.37, 120)], ["$47.50", "$0.37", "$120.00"])
@@ -149,6 +163,13 @@ class Render(unittest.TestCase):
         out = plain(sl.format_statusline(data, now=NOW, show_usage=False))
         self.assertTrue(out.startswith("Opus · xhigh │"), out)
 
+    def test_effort_is_dim_up_to_high_and_purple_beyond(self):
+        for level in ("low", "medium", "high"):
+            self.assertEqual(sl.EFFORT[level], sl.DIM, level)
+        for level in ("xhigh", "max"):
+            self.assertEqual(sl.EFFORT[level], sl.fg(141), level)
+            self.assertNotIn(sl.EFFORT[level], (sl.fg(203), sl.fg(208), sl.fg(221), sl.fg(114)))
+
     def test_effort_omitted_when_absent(self):
         out = plain(sl.format_statusline({"model": {"display_name": "Opus"}}, now=NOW, show_usage=False))
         self.assertTrue(out.startswith("Opus │"), out)
@@ -157,11 +178,29 @@ class Render(unittest.TestCase):
         self.assertEqual([sl.fmt_tokens(n) for n in (0, 950, 1_000, 12_345, 135_277, 200_000, 1_000_000, 1_250_000)],
                          ["0", "950", "1k", "12k", "135k", "200k", "1M", "1.2M"])
 
-    def test_shows_live_percent_and_reset_countdown(self):
-        usage = sl.merge_usage({}, live(five=(56, NOW + 14 * 60 + 5), seven=(48, NOW + 5 * 24 * HOUR + 2 * HOUR)), NOW)
+    def test_reset_countdown_shows_only_from_70_percent(self):
+        usage = sl.merge_usage({}, live(five=(74, NOW + 2 * HOUR + 10 * 60), seven=(48, NOW + 5 * 24 * HOUR)), NOW)
+        raw = sl.format_statusline({"model": {"display_name": "Opus"}}, usage=usage, now=NOW)
+        out = plain(raw)
+        self.assertRegex(out, "5h 74% \\S+ →2h │")
+        self.assertRegex(out, "7d 48% \\S+ │")
+        self.assertNotIn("5d", out)
+        self.assertIn(f"{sl.bar(74)} {sl.DIM}→2h{sl.RST}", raw)
+        usage = sl.merge_usage({}, live(five=(69, NOW + HOUR), seven=(70, NOW + 3 * 24 * HOUR)), NOW)
         out = plain(sl.format_statusline({"model": {"display_name": "Opus"}}, usage=usage, now=NOW))
-        self.assertRegex(out, "5h 56% \\S+ 14m")
-        self.assertRegex(out, "7d 48% \\S+ 5d2h")
+        self.assertNotIn("5h 69% █████ →", out)
+        self.assertIn("7d 70% █████ →3d", out)
+
+    def test_the_countdown_stays_with_its_meter_even_without_the_bar(self):
+        usage = sl.merge_usage({}, live(five=(90, NOW + 45 * 60), seven=(10, NOW + HOUR)), NOW)
+        data = {"model": {"display_name": "Opus"}}
+        wide = plain(sl.format_statusline(data, usage, NOW))
+        self.assertIn("5h 90% █████ →45m", wide)
+        for width in range(sl.visible_width(wide) - 1, 38, -1):
+            out = plain(sl.format_statusline(data, usage, NOW, width=width))
+            self.assertIn("5h 90% ", out)
+            self.assertIn("→45m", out, (width, out))
+            self.assertLessEqual(sl.visible_width(out), width, out)
 
     def test_usage_label_takes_the_percentage_color(self):
         usage = sl.merge_usage({}, live(five=(56, NOW + HOUR)), NOW)
@@ -365,19 +404,24 @@ class McpLogFiles(unittest.TestCase):
             for i in range(5):
                 f = d / f"2026-10-09T20-0{i}-00-000Z.jsonl"
                 f.write_text(json.dumps({"debug": "Successfully connected", "sessionId": f"other{i}"}) + "\n")
-            logs = sl.read_mcp_logs(pathlib.Path(root), since=os.path.getmtime(ours) - 60)
+            logs = sl.read_mcp_logs(root)
             self.assertEqual(sl.mcp_status(logs, "me"), (["x"], []))
 
-    def test_skips_files_last_written_before_the_session(self):
-        import json, os, tempfile, time
+    def test_only_connection_events_are_kept(self):
+        # The scan is shared through the probe cache file, so it keeps only what mcp_status reads.
+        import json, tempfile
         with tempfile.TemporaryDirectory() as root:
             d = pathlib.Path(root) / "mcp-logs-plugin-x-x"
             d.mkdir()
-            old = d / "2026-10-01T10-00-00-000Z.jsonl"
-            old.write_text(json.dumps({"debug": "Successfully connected", "sessionId": "me"}) + "\n")
-            os.utime(old, (time.time() - 86400, time.time() - 86400))
-            logs = sl.read_mcp_logs(pathlib.Path(root), since=time.time() - 3600)
-            self.assertEqual(logs, {"plugin-x-x": []})
+            (d / "a.jsonl").write_text("\n".join(json.dumps(e) for e in (
+                {"debug": "Successfully connected (transport: stdio) in 4ms", "sessionId": "me", "timestamp": "1"},
+                {"error": "Tool call failed: timeout", "sessionId": "me", "timestamp": "2"},
+                {"debug": "Received 400 tools", "sessionId": "me", "timestamp": "3", "big": "x" * 5000},
+                {"error": "Connection failed (CLOSED): closed", "sessionId": "me", "timestamp": "4"})) + "\n")
+            logs = sl.read_mcp_logs(root)
+        self.assertEqual([e["timestamp"] for e in logs["plugin-x-x"]], ["1", "4"])
+        self.assertEqual(sl.read_mcp_logs(None), None)
+        self.assertEqual(sl.read_mcp_logs(os.path.join(root, "gone")), None)
 
 
 class McpNames(unittest.TestCase):
@@ -389,109 +433,81 @@ class McpNames(unittest.TestCase):
 
 
 class HealthMarks(unittest.TestCase):
-    """health_marks() -> [(text, level)] for mcp, Claude Code and plugins; level 0 ok, 1 amber, 2 red."""
+    """health_marks() -> [(text, level, word)]: one '✓ mcp 3 · 2.1.296' cluster when all is well,
+    else one item per problem. Levels: OK 0 < RELOAD (grey) < UPDATE (amber) < FAILED (red)."""
 
     def tearDown(self):
         sl.set_icons("none")
 
     def texts(self, *args):
-        return [(plain(t), lvl) for t, lvl in sl.health_marks(*args)]
+        return [(plain(t), lvl, word) for t, lvl, word in sl.health_marks(*args)]
 
-    def test_all_good(self):
+    def test_levels_are_ordered_by_severity(self):
+        self.assertEqual((sl.OK, sl.RELOAD, sl.UPDATE, sl.FAILED), (0, 1, 2, 3))
+
+    def test_all_good_is_one_cluster(self):
         got = self.texts("2.1.296", ("ok", None), [], (["a"] * 3, []))
-        self.assertEqual(got, [("mcp 3 ✓", 0), ("CC 2.1.296 ✓", 0), ("plugins ✓", 0)])
+        self.assertEqual(got, [("✓ mcp 3 · 2.1.296", sl.OK, "")])
 
-    def test_healthy_marks_are_green(self):
-        for text, _ in sl.health_marks("2.1.296", ("ok", None), [], (["a"], [])):
-            self.assertIn(f"{sl.GREEN}{sl.ICON['ok']}{sl.RST}", text)
+    def test_the_cluster_is_a_green_tick_and_dim_text(self):
+        (text, _, _), = sl.health_marks("2.1.296", ("ok", None), [], (["a"], []))
+        self.assertEqual(text, f"{sl.GREEN}✓{sl.RST} {sl.DIM}mcp 1 · 2.1.296{sl.RST}")
 
-    def test_failed_server_is_named_in_red(self):
-        marks = sl.health_marks(None, ("unknown", None), None, (["a"] * 13, ["Gmail"]))
-        self.assertEqual([(plain(t), lvl) for t, lvl in marks], [("▲ Gmail failed", 2)])
-        self.assertIn(sl.RED, marks[0][0])
-        got = self.texts(None, ("unknown", None), None, ([], ["Gmail", "x", "y"]))
-        self.assertEqual(got, [("▲ Gmail +2 failed", 2)])
+    def test_the_cluster_shows_what_it_knows(self):
+        self.assertEqual(self.texts("2.1.296", ("ok", None), None, None), [("✓ 2.1.296", 0, "")])
+        self.assertEqual(self.texts(None, ("unknown", None), None, (["a", "b"], [])), [("✓ mcp 2", 0, "")])
+        self.assertEqual(self.texts("2.1.296", ("unknown", None), [], None), [("✓ 2.1.296", 0, "")])  # plugins checked
 
-    def test_long_server_names_are_shortened(self):
-        got = self.texts(None, ("unknown", None), None, (["a"], ["a-very-long-server-name-x"]))
-        self.assertEqual(got[0][0], "▲ a-ver…name-x failed")
-
-    def test_update_and_restart_are_amber(self):
-        marks = sl.health_marks("2.1.290", ("update", "2.2"), None, None)
-        self.assertEqual([(plain(t), lvl) for t, lvl in marks], [("↑ 2.2 available", 1)])
-        self.assertIn(sl.AMBER, marks[0][0])
-        self.assertEqual(self.texts("2.1.290", ("update", None), None, None), [("↑ update", 1)])
-        self.assertEqual(self.texts("2.1.290", ("restart", "2.1.296"), None, None),
-                         [("↑ restart for 2.1.296", 1)])
-
-    def test_plugins_to_reload_are_amber(self):
-        marks = sl.health_marks(None, ("unknown", None), ["p1", "p2"], None)
-        self.assertEqual([(plain(t), lvl) for t, lvl in marks], [("~ reload", 1)])
-        self.assertIn(sl.AMBER, marks[0][0])
-
-    def test_running_version_without_a_verdict_is_shown_plain(self):
-        self.assertEqual(self.texts("2.1.296", ("unknown", None), None, None), [("CC 2.1.296", 0)])
+    def test_a_version_nothing_vouches_for_has_no_tick(self):
+        self.assertEqual(self.texts("2.1.296", ("unknown", None), None, None), [("2.1.296", 0, "")])
 
     def test_marks_without_data_are_hidden(self):
         self.assertEqual(sl.health_marks(None, ("unknown", None), None, None), [])
         self.assertEqual(sl.health_marks(None, ("unknown", None), None, ([], [])), [])
 
+    def test_failed_server_is_named_in_red(self):
+        marks = sl.health_marks("2.1.296", ("ok", None), [], (["a"] * 13, ["Gmail"]))
+        self.assertEqual([(plain(t), lvl, w) for t, lvl, w in marks], [("▲ Gmail", sl.FAILED, "Gmail")])
+        self.assertTrue(marks[0][0].startswith(sl.RED))
+        got = self.texts(None, ("unknown", None), None, ([], ["Gmail", "x", "y"]))
+        self.assertEqual(got, [("▲ Gmail +2", sl.FAILED, "Gmail")])
+
+    def test_problems_replace_the_cluster(self):
+        got = self.texts("2.1.296", ("ok", None), [], (["a"] * 13, ["Gmail"]))
+        self.assertNotIn("mcp 13", "".join(t for t, _, _ in got))
+        self.assertNotIn("✓", "".join(t for t, _, _ in got))
+
+    def test_long_server_names_are_shortened(self):
+        got = self.texts(None, ("unknown", None), None, (["a"], ["a-very-long-server-name-x"]))
+        self.assertEqual(got[0][0], "▲ a-ver…name-x")
+
+    def test_update_and_restart_are_amber(self):
+        marks = sl.health_marks("2.1.290", ("update", "2.2.0"), None, None)
+        self.assertEqual([(plain(t), lvl, w) for t, lvl, w in marks], [("↑ 2.2.0", sl.UPDATE, "2.2.0")])
+        self.assertTrue(marks[0][0].startswith(sl.AMBER))
+        self.assertEqual(self.texts("2.1.290", ("update", None), None, None), [("↑ update", sl.UPDATE, "update")])
+        self.assertEqual(self.texts("2.1.290", ("restart", "2.1.296"), None, None),
+                         [("↑ restart", sl.UPDATE, "restart")])
+
+    def test_plugins_to_reload_are_grey_advice(self):
+        marks = sl.health_marks(None, ("unknown", None), ["p1", "p2"], None)
+        self.assertEqual([(plain(t), lvl, w) for t, lvl, w in marks], [("~reload", sl.RELOAD, "reload")])
+        self.assertTrue(marks[0][0].startswith(sl.DIM))
+        self.assertNotIn(sl.AMBER, marks[0][0])
+
+    def test_every_problem_is_its_own_item_in_order(self):
+        got = self.texts("2.1.290", ("update", "2.2.0"), ["p"], (["a"], ["Gmail"]))
+        self.assertEqual(got, [("▲ Gmail", sl.FAILED, "Gmail"), ("↑ 2.2.0", sl.UPDATE, "2.2.0"),
+                               ("~reload", sl.RELOAD, "reload")])
+
     def test_nerd_marks_use_nerd_icons(self):
         sl.set_icons("nerd")
         got = self.texts("2.1.296", ("ok", None), [], (["a"], []))
-        self.assertEqual([t for t, _ in got], [f"{sl.ICON['mcp']} mcp 1 {sl.ICON['ok']}",
-                                                f"{sl.ICON['cc']} CC 2.1.296 {sl.ICON['ok']}",
-                                                f"{sl.ICON['plugins']} plugins {sl.ICON['ok']}"])
+        self.assertEqual([t for t, _, _ in got], [f"{sl.ICON['ok']} mcp 1 · 2.1.296"])
         got = self.texts("2.1.290", ("update", "2.2"), ["p"], (["a"], ["Gmail"]))
-        self.assertEqual([t for t, _ in got], [f"{sl.ICON['warn']} Gmail failed",
-                                                f"{sl.ICON['up']} 2.2 available",
-                                                f"{sl.ICON['reload']} reload"])
+        self.assertEqual([t for t, _, _ in got], [f"{sl.ICON['warn']} Gmail", f"{sl.ICON['up']} 2.2",
+                                                   f"{sl.ICON['reload']} reload"])
         self.assertNotEqual(sl.ICON["reload"], sl.ICON["up"])
-
-
-class Subagents(unittest.TestCase):
-    def asst(self, stop, model="claude-haiku-5-5", effort="medium", cache_read=47_743):
-        return {"type": "assistant", "effort": effort, "message": {
-            "model": model, "stop_reason": stop,
-            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 1935,
-                      "cache_read_input_tokens": cache_read, "output_tokens": 9}}}
-
-    def test_running_agent_reports_model_effort_tokens(self):
-        entries = [{"type": "user"}, self.asst("tool_use"), {"type": "user"}, {"type": "attachment"}]
-        self.assertEqual(sl.subagent_state(entries),
-                         {"model": "claude-haiku-5-5", "effort": "medium", "tokens": 49_680, "running": True})
-
-    def test_finished_agent(self):
-        entries = [{"type": "user"}, self.asst("tool_use"), {"type": "user"}, self.asst("end_turn")]
-        self.assertFalse(sl.subagent_state(entries)["running"])
-
-    def test_agent_with_no_reply_yet_is_running(self):
-        self.assertEqual(sl.subagent_state([{"type": "user"}]),
-                         {"model": None, "effort": None, "tokens": 0, "running": True})
-
-    def test_model_display_names(self):
-        self.assertEqual([sl.fmt_model_id(m) for m in ("claude-haiku-5-5", "claude-opus-5-5[1m]", "claude-sonnet-4-6", "custom-x")],
-                         ["Haiku 5.5", "Opus 5.5", "Sonnet 4.6", "custom-x"])
-
-    def test_agents_line(self):
-        agents = [
-            {"type": "claude-code-guide", "model": "claude-haiku-5-5", "effort": "medium", "tokens": 49_680},
-            {"type": "Explore", "model": "claude-sonnet-5-5", "effort": None, "tokens": 120_000},
-            {"type": "general-purpose", "model": None, "effort": None, "tokens": 0},
-            {"type": "Plan", "model": "claude-opus-5-5", "effort": "high", "tokens": 5_000},
-        ]
-        self.assertEqual(plain(sl.format_agents(agents)),
-                         "agents 4 │ claude-code-guide Haiku 5.5 · medium 50k"
-                         " │ Explore Sonnet 5.5 120k │ general-purpose │ +1")
-
-    def test_agent_name_and_model_use_model_color(self):
-        out = sl.format_agents([{"type": "Explore", "model": "claude-sonnet-5-5", "effort": None, "tokens": 1}])
-        c = sl.model_color("claude-sonnet-5-5")
-        self.assertIn(f"{c}Explore", out)
-        self.assertIn(f"{c}Sonnet 5.5", out)
-
-    def test_no_running_agents_no_line(self):
-        self.assertEqual(sl.format_agents([]), "")
 
 
 class ModelColors(unittest.TestCase):
@@ -502,6 +518,13 @@ class ModelColors(unittest.TestCase):
         self.assertEqual(sl.model_color("claude-opus-4-6"), sl.model_color("claude-opus-5-5[1m]"))
         self.assertEqual(sl.model_color("something-else"), sl.MODEL)
         self.assertEqual(sl.model_color(None), sl.MODEL)
+
+    def test_opus_is_terracotta_and_no_family_borrows_a_stage_color(self):
+        self.assertEqual(sl.model_color("claude-opus-5-5"), sl.fg(173))
+        self.assertEqual(sl.MODEL, sl.fg(173))
+        stage_colors = {c for _, c in sl.STAGES} | {sl.RED}
+        for m in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "x"):
+            self.assertNotIn(sl.model_color(m), stage_colors, m)
 
     def test_main_model_name_uses_its_color(self):
         data = {"model": {"id": "claude-haiku-5-5", "display_name": "Haiku 5.5"}}
@@ -518,23 +541,41 @@ class Layout(unittest.TestCase):
         self.assertEqual(sl.bar(2), f"{sl.color_pct(2)}█{sl.RST}{sl.BAR_TRACK}{'█' * 4}{sl.RST}")
         self.assertEqual(sl.bar(0), f"{sl.color_pct(0)}{sl.RST}{sl.BAR_TRACK}{'█' * 5}{sl.RST}")
 
+    def filled(self, p):
+        raw = sl.bar(p)
+        return len(raw.split(sl.RST)[0].replace(sl.color_pct(p), ""))
+
+    def test_plain_bars_fill_by_stage(self):
+        # 1 cell below 25%, 2 below 50, 3 below 70, 4 below 85, 5 from 85: a green value never shows
+        # more than 2 cells, a red one always shows 5.
+        cases = {0: 0, 1: 1, 24: 1, 25: 2, 49: 2, 50: 3, 69: 3, 70: 4, 84: 4, 85: 5, 100: 5}
+        self.assertEqual({p: self.filled(p) for p in cases}, cases)
+        for p in range(0, 101):
+            cells, color = self.filled(p), sl.color_pct(p)
+            if color == sl.STAGES[0][1]:
+                self.assertLessEqual(cells, 2, p)
+            if color == sl.RED:
+                self.assertEqual(cells, 5, p)
+
     def test_long_branch_is_not_capped_when_there_is_room(self):
         branch = "live-usage-and-redesign-of-the-meters"
         out = plain(sl.where_item("claude-code-statusline", (branch, []), width=116))
         self.assertEqual(out, f"claude-code-statusline › {branch}")
 
-    def test_project_and_branch_shrink_from_the_middle_to_fit(self):
+    def test_branch_is_cut_from_its_end_before_the_project_is_touched(self):
         proj, branch = "claude-code-statusline", "live-usage-and-redesign-of-the-meters"
         out = plain(sl.where_item(proj, (branch, ["+1"]), width=40))
-        self.assertLessEqual(len(out), 40, out)
-        self.assertGreaterEqual(len(out), 38, out)  # shortened just enough
-        p, b = out.split(" › ")
-        self.assertIn("…", p + b)
-        self.assertTrue(b.endswith(" +1"), out)
-        for short, full in ((p, proj), (b[:-3], branch)):
-            if "…" in short:
-                head, tail = short.split("…")
-                self.assertTrue(full.startswith(head) and full.endswith(tail), short)
+        self.assertEqual(out, "claude-code-statusline › live-usage-… +1")  # exactly 40, project whole
+        out = plain(sl.where_item(proj, (branch, ["+1"]), width=36))
+        self.assertEqual(out, "claude-code-statusline › live-us… +1")  # the shortest branch: 7 + …
+
+    def test_branch_goes_before_the_project_loses_a_character(self):
+        proj, branch = "claude-code-statusline", "live-usage-and-redesign"
+        self.assertEqual(plain(sl.where_item(proj, (branch, ["+1"]), width=30)), proj)
+        self.assertEqual(plain(sl.where_item(proj, (branch, ["+1"]), width=22)), proj)
+        out = plain(sl.where_item(proj, (branch, ["+1"]), width=20))
+        self.assertEqual(out, sl.mid_trunc(proj, 20))
+        self.assertEqual(plain(sl.where_item(proj, (branch, []), width=10)), sl.mid_trunc(proj, sl.MIN_NAME))
 
     def test_middle_ellipsis(self):
         self.assertEqual(sl.mid_trunc("claude-code-statusline", 30), "claude-code-statusline")
@@ -566,6 +607,15 @@ class SlantedBars(unittest.TestCase):
         sl.set_icons("nerd")
         self.assertIn(f"{sl.color_pct(3)}{self.SEG}{sl.RST}{sl.BAR_TRACK}{self.SEG * 2}", sl.bar(3))
 
+    def test_segments_fill_by_stage(self):
+        # one segment while green (<50%), two while yellow or orange, all three when red (85%+)
+        sl.set_icons("nerd")
+
+        def filled(p):
+            return len(sl.bar(p).split(sl.RST)[0].replace(sl.color_pct(p), "")) // len(self.SEG)
+        cases = {0: 0, 1: 1, 49: 1, 50: 2, 69: 2, 70: 2, 84: 2, 85: 3, 100: 3}
+        self.assertEqual({p: filled(p) for p in cases}, cases)
+
 
 class Icons(unittest.TestCase):
     DATA = {"model": {"display_name": "Opus"}, "cost": {"total_cost_usd": 2.39},
@@ -579,16 +629,70 @@ class Icons(unittest.TestCase):
         self.assertTrue(out.startswith("Opus │ ctx"), out)
         self.assertIn("$2.39", out)
 
-    def test_nerd_icons(self):
+    def test_nerd_mode_has_no_icons_on_model_ctx_or_cost(self):
         sl.set_icons("nerd")
         out = plain(sl.format_statusline(self.DATA, now=NOW, show_usage=False))
-        self.assertTrue(out.startswith("\U000F167A Opus │ \U000F0830 ctx"), out)
-        self.assertIn("\U000F01C1 2.39", out)
-        self.assertEqual(sl.ICON["cost"], "\U000F01C1")
+        self.assertTrue(out.startswith("Opus │ ctx 14% "), out)
+        self.assertTrue(out.endswith(" │ $2.39"), out)
+        for name in ("model", "ctx", "cost", "project", "branch", "mcp", "cc", "plugins", "skills", "agents"):
+            self.assertNotIn(name, sl.NERD_ICONS, name)
+        for name in ("five_hour", "seven_day", "duration", "tag", "venv", "ports", "ok", "up", "warn", "reload", "segment"):
+            self.assertIn(name, sl.NERD_ICONS, name)
 
-    def test_cost_is_bold_bright_green(self):
+    def test_separators_are_dimmer_than_labels(self):
+        self.assertEqual(sl.SEP, f" {sl.fg(240)}│{sl.RST} ")
+        self.assertEqual(sl.DIM, sl.fg(252))
+
+    def test_cost_is_plain_green_not_bold(self):
         out = sl.format_statusline(self.DATA, now=NOW, show_usage=False)
-        self.assertIn("[1;38;5;46m$2.39", out)
+        self.assertIn(f"{sl.fg(114)}$2.39{sl.RST}", out)
+        self.assertNotIn("[1;", out)
+        self.assertEqual(sl.COST, sl.GREEN)
+
+
+class Theme(unittest.TestCase):
+    """STATUSLINE_THEME=light swaps the palette for one that reads on a white background."""
+
+    def tearDown(self):
+        sl.set_theme("dark")
+
+    def test_light_palette(self):
+        sl.set_theme("light")
+        self.assertEqual(sl.DIM, sl.fg(244))
+        self.assertEqual([c for _, c in sl.STAGES], [sl.fg(28), sl.fg(136), sl.fg(166)])
+        self.assertEqual(sl.RED, sl.fg(160))
+        self.assertEqual(sl.COST, sl.fg(28))
+        self.assertEqual(sl.SEP, f" {sl.fg(250)}│{sl.RST} ")
+        self.assertEqual(sl.color_pct(10), sl.fg(28))
+        self.assertEqual(sl.EFFORT["low"], sl.fg(244))
+        self.assertNotIn(sl.fg(252), sl.format_statusline(SingleLine.DATA, now=NOW))
+
+    def test_default_and_unknown_names_are_the_dark_palette(self):
+        sl.set_theme("light")
+        sl.set_theme("bananas")
+        self.assertEqual(sl.DIM, sl.fg(252))
+        self.assertEqual(sl.color_pct(10), sl.fg(114))
+        self.assertEqual(sl.SEP, f" {sl.fg(240)}│{sl.RST} ")
+
+    def test_every_light_color_reads_on_white(self):
+        # 3:1 contrast against white (WCAG for large text and UI parts) for every xterm-256 index used as text.
+        def luminance(index):
+            if index >= 232:
+                v = 8 + (index - 232) * 10
+                rgb = (v, v, v)
+            else:
+                i = index - 16
+                steps = (0, 95, 135, 175, 215, 255)
+                rgb = (steps[i // 36], steps[i // 6 % 6], steps[i % 6])
+            lin = [(c / 255 / 12.92) if c / 255 <= 0.03928 else ((c / 255 + 0.055) / 1.055) ** 2.4 for c in rgb]
+            return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+        for name, value in sl.THEMES["light"].items():
+            if name in ("TRACK", "SEP"):
+                continue  # lines, not text
+            indices = list(value.values()) if isinstance(value, dict) else list(value) if isinstance(value, tuple) else [value]
+            for index in indices:
+                ratio = 1.05 / (luminance(index) + 0.05)
+                self.assertGreaterEqual(ratio, 3.0, (name, index, ratio))
 
 
 class SingleLine(unittest.TestCase):
@@ -601,8 +705,8 @@ class SingleLine(unittest.TestCase):
     GIT = ("live-usage-and-redesign", [f"{sl.AMBER}~2{sl.RST}"])
     PROJ = "claude-code-statusline"
     NAME = "statusline-py-usage-accuracy"
-    OK = [("mcp 3 ✓", 0), ("CC 2.1.296 ✓", 0), ("plugins ✓", 0)]
-    BAD = [("▲ Gmail failed", 2), ("↑ 2.2 available", 1), ("~ reload", 1)]
+    OK = [("✓ mcp 3 · 2.1.296", 0, "")]
+    BAD = [("▲ Gmail", 3, "Gmail"), ("↑ 2.2.0", 2, "2.2.0"), ("~reload", 1, "reload")]
 
     def tearDown(self):
         sl.set_icons("none")
@@ -636,8 +740,8 @@ class SingleLine(unittest.TestCase):
         out = plain(self.line(300, **self.full()))
         b = lambda p: plain(sl.bar(p))
         self.assertEqual(out, f"claude-code-statusline › live-usage-and-redesign ~2 “{self.NAME}”"
-                              f" │ Opus 5.5 · high │ ctx 43% {b(43)} 430k/1M │ 5h 74% {b(74)} 2h10m"
-                              f" │ 7d 69% {b(69)} 5d14h │ $35.50 │ session 12m │ mcp 3 ✓ │ CC 2.1.296 ✓ │ plugins ✓"
+                              f" │ Opus 5.5 · high │ ctx 43% {b(43)} 430k/1M │ 5h 74% {b(74)} →2h"
+                              f" │ 7d 69% {b(69)} │ $35.50 │ session 12m │ ✓ mcp 3 · 2.1.296"
                               f" │ skills 69 │ venv:x │ :3000")
 
     def test_no_extras_is_just_the_session_items(self):
@@ -651,7 +755,7 @@ class SingleLine(unittest.TestCase):
 
     def test_countdown_follows_the_bar_in_light_grey(self):
         raw = self.line(300)
-        self.assertIn(f"{sl.bar(74)} {sl.DIM}2h10m{sl.RST}", raw)
+        self.assertIn(f"{sl.bar(74)} {sl.DIM}→2h{sl.RST}", raw)
         self.assertIn(f"{sl.bar(43)} {sl.DIM}430k/1M{sl.RST}", raw)
 
     def test_percentages_keep_stage_colors_on_label_and_value(self):
@@ -700,11 +804,13 @@ class SingleLine(unittest.TestCase):
     def test_nerd_icons_and_three_segment_bars(self):
         sl.set_icons("nerd")
         out = plain(self.line(300, name=self.NAME, marks=self.OK))
-        head = (f"{sl.ICON['project']} claude-code-statusline › {sl.ICON['branch']} live-usage-and-redesign ~2 "
-                f"{sl.ICON['tag']} {self.NAME} │ {sl.ICON['model']} Opus 5.5 · high")
+        head = (f"claude-code-statusline › live-usage-and-redesign ~2 "
+                f"{sl.ICON['tag']} {self.NAME} │ Opus 5.5 · high │ ctx 43% ")
         self.assertTrue(out.startswith(head), out)
         self.assertEqual(out.count(sl.ICON["segment"]), 9)
-        self.assertIn(f"{sl.ICON['skills']} skills 69", out)
+        self.assertIn(f"{sl.ICON['five_hour']} 5h 74% ", out)
+        self.assertIn("│ $35.50 │", out)
+        self.assertTrue(out.endswith("│ skills 69"), out)
 
     def test_nerd_unknown_usage_has_no_bar(self):
         sl.set_icons("nerd")
@@ -721,14 +827,15 @@ class SingleLine(unittest.TestCase):
         return found[-1] if found else None
 
     def test_items_drop_in_the_documented_order(self):
-        keys = ["venv:x", "skills 69", "2h10m", "session 12m", "plugins ✓", "CC 2.1.296", "mcp 3",
-                "“", "live-usage", "claude-code", "430k/1M", "$35.50"]
+        keys = ["venv:x", "skills 69", "session 12m", "✓ mcp 3 · 2.1.296",
+                "“", "live-usage", "claude-code", "430k/1M", "$35.50", "· high"]
         widths = [self.last_width(k) for k in keys]
         self.assertNotIn(None, widths)
         self.assertEqual(self.last_width(":3000"), widths[0])
-        self.assertEqual(self.last_width("5d14h"), widths[2])
         self.assertEqual(widths, sorted(widths, reverse=True), dict(zip(keys, widths)))
         self.assertEqual(len(set(widths)), len(widths) - 0, dict(zip(keys, widths)))
+        self.assertIsNone(self.last_width("5d"))  # 7d is at 69%: no countdown
+        self.assertEqual(self.last_width("→2h"), self.last_width("5h 74%"))  # the 5h countdown never goes alone
 
     def test_ports_and_venv_go_first(self):
         n = sl.visible_width(plain(self.line(300, **self.full())))
@@ -736,34 +843,32 @@ class SingleLine(unittest.TestCase):
         self.assertNotIn("venv:x", got)
         self.assertNotIn(":3000", got)
         self.assertIn("skills 69", got)
-        self.assertIn("2h10m", got)
+        self.assertIn("→2h", got)
 
-    def test_skills_go_second_and_countdowns_third(self):
+    def test_skills_go_second_and_session_time_third(self):
         kw = self.full(ports="", venv="")
         n = sl.visible_width(plain(self.line(300, **kw)))
         got = plain(self.line(n + sl.EDGE - 1, **kw))
         self.assertNotIn("skills 69", got)
-        self.assertIn("2h10m", got)
+        self.assertIn("session 12m", got)
         kw = self.full(ports="", venv="", skills=None)
         n = sl.visible_width(plain(self.line(300, **kw)))
         got = plain(self.line(n + sl.EDGE - 1, **kw))
-        self.assertNotIn("2h10m", got)
-        self.assertNotIn("5d14h", got)
-        self.assertIn("session 12m", got)
-        self.assertIn("plugins ✓", got)
+        self.assertNotIn("session 12m", got)
+        self.assertIn("→2h", got)
+        self.assertIn("✓ mcp 3 · 2.1.296", got)
         self.assertIn("430k/1M", got)
 
-    def test_healthy_marks_go_from_the_last_then_the_name(self):
+    def test_the_healthy_cluster_goes_then_the_name(self):
         kw = self.full(ports="", venv="", skills=None)
         stages = []
         for w in range(300, 20, -1):
             out = plain(self.line(w, **kw))
-            state = tuple(k in out for k in ("session 12m", "plugins ✓", "CC 2.1.296", "mcp 3", "“"))
+            state = tuple(k in out for k in ("session 12m", "✓ mcp 3 · 2.1.296", "“"))
             if not stages or stages[-1] != state:
                 stages.append(state)
-        self.assertEqual(stages[:6], [(True, True, True, True, True), (False, True, True, True, True),
-                                      (False, False, True, True, True), (False, False, False, True, True),
-                                      (False, False, False, False, True), (False, False, False, False, False)])
+        self.assertEqual(stages[:4], [(True, True, True), (False, True, True), (False, False, True),
+                                      (False, False, False)])
 
     def test_branch_is_shortened_then_dropped_before_the_project_is_touched(self):
         kw = self.full(ports="", venv="", skills=None, marks=[], name=None)
@@ -774,8 +879,8 @@ class SingleLine(unittest.TestCase):
             state = ("live-usage-and-redesign" in first, "live-usage…" in first, "live-" in first, "claude-code-statusline" in first)
             if not seen or seen[-1] != state:
                 seen.append(state)
-        # full branch -> (mid-truncated by the soft cap) -> short branch -> no branch; the project stays whole
-        # until the branch is gone
+        # full branch -> (mid-truncated by the soft cap) -> short branch (then without its counts) -> no branch;
+        # the project stays whole until the branch is gone
         short = [s for s in seen if s[1]]
         self.assertTrue(short, seen)
         gone = [s for s in seen if not s[2]]
@@ -821,24 +926,23 @@ class SingleLine(unittest.TestCase):
 
     def test_problems_are_named_while_there_is_room(self):
         out = plain(self.line(300, **self.full(marks=self.BAD)))
-        self.assertIn("▲ Gmail failed │ ↑ 2.2 available │ ~ reload", out)
+        self.assertIn("│ ▲ Gmail │ ↑ 2.2.0 │ ~reload │", out)
         self.assertNotIn("mcp 3", out)
 
-    def test_problems_outlast_countdowns_and_session_time(self):
+    def test_problems_outlast_session_time(self):
         kw = self.full(ports="", venv="", skills=None, marks=self.BAD)
         n = sl.visible_width(plain(self.line(300, **kw)))
         got = plain(self.line(n + sl.EDGE - 1, **kw))
-        self.assertNotIn("2h10m", got)
-        self.assertIn("▲ Gmail failed │ ↑ 2.2 available │ ~ reload", got)
+        self.assertNotIn("session 12m", got)
+        self.assertIn("▲ Gmail │ ↑ 2.2.0 │ ~reload", got)
 
     def test_warning_texts_go_from_the_last_then_a_bare_marker_takes_over(self):
         kw = self.full(ports="", venv="", skills=None, marks=self.BAD, git=None, name=None)
-        warn = sl.ICON["warn"]
         seen = []
         for w in range(300, 50, -1):
             out = plain(self.line(w, **kw))
-            state = ("▲ Gmail failed" in out, "↑ 2.2 available" in out, "~ reload" in out,
-                     out.endswith(warn), "$35.50" in out, "█" in out, "430k/1M" in out)
+            state = ("▲ Gmail" in out, "↑ 2.2.0" in out, "~reload" in out,
+                     out.endswith(("▲", "▲Gmail")), "$35.50" in out, "█" in out, "430k/1M" in out)
             if not seen or seen[-1] != state:
                 seen.append(state)
         flags = [s[:3] for s in seen]
@@ -853,6 +957,21 @@ class SingleLine(unittest.TestCase):
         self.assertTrue(any(s[3] and s[4] and s[5] and s[6] for s in seen))
         self.assertTrue(any(s[3] and not s[4] and not s[5] and not s[6] for s in seen), seen)
 
+    def test_the_bare_marker_carries_a_reason_when_eight_columns_are_free(self):
+        kw = self.full(ports="", venv="", skills=None, marks=self.BAD, git=None, name=None)
+        n = sl.visible_width(plain(self.line(300, **kw)))
+        reasons, bare = [], []
+        for w in range(n + sl.EDGE - 1, 50, -1):
+            out = plain(self.line(w, **kw))
+            if out.endswith("▲Gmail"):
+                reasons.append(w)
+                self.assertGreaterEqual(w - sl.EDGE - sl.visible_width(out[:-5]), 8, (w, out))
+            elif out.endswith("▲"):
+                bare.append(w)
+                self.assertLess(w - sl.EDGE - sl.visible_width(out), 8, (w, out))
+        self.assertTrue(reasons and bare, (reasons, bare))
+        self.assertNotIn(" Gmail", "".join(plain(self.line(w, **kw)) for w in reasons))  # never the item text too
+
     def test_bare_marker_stays_down_to_model_and_percentages(self):
         kw = self.full(ports="", venv="", skills=None, marks=self.BAD, git=None, name=None)
         small = plain(self.line(52, **kw))
@@ -861,14 +980,31 @@ class SingleLine(unittest.TestCase):
         for want in ("Opus 5.5", "ctx 43%", "5h 74%", "7d 69%"):
             self.assertIn(want, small)
 
-    def test_marker_is_red_for_a_failed_server_and_amber_for_the_rest(self):
+    def test_marker_takes_the_glyph_and_color_of_the_worst_problem(self):
         kw = self.full(ports="", venv="", skills=None, git=None, name=None)
         raw = self.line(52, **{**kw, "marks": self.BAD})
         self.assertTrue(raw.endswith(f"{sl.RED}{sl.ICON['warn']}{sl.RST}"), repr(raw[-30:]))
         raw = self.line(52, **{**kw, "marks": self.BAD[1:]})
-        self.assertTrue(raw.endswith(f"{sl.AMBER}{sl.ICON['warn']}{sl.RST}"), repr(raw[-30:]))
+        self.assertTrue(raw.endswith(f"{sl.AMBER}{sl.ICON['up']}{sl.RST}"), repr(raw[-30:]))
+        raw = self.line(52, **{**kw, "marks": self.BAD[2:]})
+        self.assertTrue(raw.endswith(f"{sl.DIM}{sl.ICON['reload']}{sl.RST}"), repr(raw[-30:]))
         ok = plain(self.line(52, **{**kw, "marks": self.OK}))
         self.assertNotIn(sl.ICON["warn"], ok)
+        for marks, reason in ((self.BAD[1:], "↑2.2.0"), (self.BAD[2:], "~reload")):
+            ends = {plain(self.line(w, **{**kw, "marks": marks})).split(" ")[-1] for w in range(50, 130)}
+            self.assertIn(reason, ends, marks)  # some width has the room for the reason
+            self.assertIn(reason[0], ends, marks)  # some has only the glyph's
+
+    def test_nerd_marker_keeps_a_space_before_its_reason(self):
+        # Nerd glyphs draw past their cell; '󰀦discord' overlapped on screen.
+        sl.set_icons("nerd")
+        try:
+            kw = self.full(ports="", venv="", skills=None, marks=self.BAD[:1], git=None, name=None)
+            ends = {plain(self.line(w, **kw)).split(" │ ")[-1] for w in range(50, 130)}
+            self.assertIn(f"{sl.ICON['warn']} Gmail", ends, ends)
+            self.assertFalse(any(e.startswith(sl.ICON["warn"] + "G") for e in ends), ends)
+        finally:
+            sl.set_icons("none")
 
     def test_never_more_than_one_line_even_when_tiny(self):
         for w in (24, 30, 40):
@@ -881,7 +1017,9 @@ class SingleLine(unittest.TestCase):
         out = self.at(120, **self.full(marks=[], ports="", venv="", skills=None, name=None))
         first = out.split(" │ ")[0]
         self.assertLessEqual(len(first), 0.4 * 116)
-        self.assertIn("…", first)
+        # the project stays whole; the branch is what gets cut or dropped
+        self.assertTrue(first.startswith("claude-code-statusline"), first)
+        self.assertNotIn("…", first.split(" › ")[0])
 
     def test_every_width_fits(self):
         # 47 columns is the least that holds the model and the three percentages
@@ -1055,7 +1193,7 @@ class TempClaudeDir:
         self.proj = root / "my-special-proj"
         self.proj.mkdir()
         self.saved = {k: getattr(sl, k) for k in ("CLAUDE_DIR", "USAGE_CACHE", "USAGE_LOCK", "NATIVE_VERSIONS")}
-        sl.CLAUDE_DIR = self.dir
+        sl.CLAUDE_DIR = str(self.dir)
         sl.USAGE_CACHE = self.dir / "statusline-usage.json"
         sl.USAGE_LOCK = self.dir / "statusline-usage.lock"
         sl.NATIVE_VERSIONS = root / "versions"
@@ -1074,6 +1212,7 @@ class TempClaudeDir:
         for k, v in self.saved.items():
             setattr(sl, k, v)
         sl.set_icons("none")
+        sl.set_theme("dark")
         self.tmp.cleanup()
 
     def render(self, icons="none", columns=120, health=None, data_update=None,
@@ -1114,18 +1253,36 @@ class MainRendering(TempClaudeDir, unittest.TestCase):
         out = plain(raw)
         self.assertNotIn("\n", out)
         self.assertTrue(out.startswith("my-special-proj │ Opus 5.5 · high │ ctx 43% "), out)
-        for want in ("5h 19%", "7d 55%", "$35.50", "session 12m", "mcp 3 ✓", "CC 2.1.296 ✓", "plugins ✓",
-                     "skills 69"):
+        for want in ("5h 19%", "7d 55%", "$35.50", "session 12m", "✓ mcp 3 · 2.1.296", "skills 69"):
             self.assertIn(want, out)
         self.assertIn(sl.SEP, raw)
 
-    def test_the_mode_file_is_gone(self):
+    def test_light_theme_from_the_environment(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"STATUSLINE_THEME": "light"}):
+            raw = self.render(health=self.HEALTHY, columns=200)
+        self.assertIn(sl.fg(244), raw)
+        self.assertNotIn(sl.fg(252), raw)
+        self.assertIn(f" {sl.fg(250)}│", raw)
+        raw = self.render(health=self.HEALTHY, columns=200)
+        self.assertIn(sl.fg(252), raw)
+
+    def test_the_mode_file_and_the_agents_line_are_gone(self):
         for text in ("full", "compact", "bananas"):
             (self.dir / "statusline-mode").write_text(text, encoding="utf-8")
             self.assertEqual(plain(self.render(health=self.HEALTHY)).count("\n"), 0)
         for name in ("read_mode", "MODE_FILE_NAME", "TOGGLE_KEY", "format_compact", "compact_hint",
-                     "toggle_hint", "workspace_line", "flow", "format_health", "compact_problems"):
+                     "toggle_hint", "workspace_line", "flow", "format_health", "compact_problems",
+                     "SHOW_AGENTS", "format_agents", "running_subagents", "subagent_state", "fmt_model_id",
+                     "_tail_entries", "SUBAGENT_STALE", "SUBAGENTS_SHOWN"):
             self.assertFalse(hasattr(sl, name), name)
+
+    def test_the_script_does_not_import_pathlib(self):
+        import subprocess
+        r = subprocess.run([sys.executable, "-S", "-c", "import sys, statusline; print('pathlib' in sys.modules)"],
+                           cwd=str(pathlib.Path(sl.__file__).parent), capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.stdout.strip(), "False", r.stderr)
+        self.assertEqual(sl.CLAUDE_DIR, str(sl.CLAUDE_DIR))  # a plain string path
 
     def test_plain_120_with_a_failed_server_keeps_the_bars_and_a_warning(self):
         out = plain(self.render(health=self.DISCORD))
@@ -1141,20 +1298,35 @@ class MainRendering(TempClaudeDir, unittest.TestCase):
         for want in ("my-special-proj", "Opus 5.5", "ctx 43%", "5h 19%", "7d 55%", "35.50"):
             self.assertIn(want, out)
 
-    def test_a_failed_server_is_named_on_a_wide_window_and_red_marker_on_a_narrow_one(self):
+    def test_a_failed_server_is_named_on_a_wide_window_and_a_red_marker_on_a_narrow_one(self):
         wide = plain(self.render(icons="nerd", columns=200, health=self.DISCORD))
-        self.assertIn(f"{sl.NERD_ICONS['warn']} discord failed", wide)
-        raw = self.render(icons="nerd", columns=70, health=self.DISCORD)
-        self.assertNotIn("discord", raw)
-        self.assertIn(f"{sl.RED}{sl.NERD_ICONS['warn']}{sl.RST}", raw)
-        ok = self.render(icons="nerd", columns=70, health=self.HEALTHY)
+        self.assertIn(f"│ {sl.NERD_ICONS['warn']} discord", wide)
+        raw = self.render(icons="nerd", columns=60, health=self.DISCORD)
+        self.assertNotIn(" discord", raw)
+        self.assertIn(f"{sl.RED}{sl.NERD_ICONS['warn']}", raw)
+        ok = self.render(icons="nerd", columns=60, health=self.HEALTHY)
         self.assertNotIn(sl.NERD_ICONS["warn"], ok)
 
-    def test_absent_rate_limits_show_unknown_windows(self):
+    def test_usage_items_are_hidden_when_neither_stdin_nor_live_data_ever_had_them(self):
         for health in (None, self.DISCORD):
             out = plain(self.render(health=health, drop=("rate_limits",)))
-            self.assertRegex(out, r"5h\s+--")
-            self.assertRegex(out, r"7d\s+--")
+            self.assertNotIn("5h", out)
+            self.assertNotIn("7d", out)
+            self.assertIn("ctx 43%", out)
+
+    def test_usage_items_stay_as_unknown_once_a_source_had_them(self):
+        # stdin had the windows but they expired: the items stay, as "--"
+        expired = {"five_hour": {"used_percentage": 19, "resets_at": 5}, "seven_day": {"used_percentage": 55, "resets_at": 5}}
+        out = plain(self.render(data_update={"rate_limits": expired}))
+        self.assertIn("5h -- │ 7d --", out)
+        # live data has them even though stdin never did
+        from unittest import mock
+        cached = {"usage": {"five_hour": {"utilization": 31, "resets_at": "2099-01-01T00:00:00Z"}}}
+        with mock.patch.object(sl, "load_usage_cache", return_value=cached), mock.patch.object(sl, "maybe_refresh"), \
+                mock.patch.object(sl, "read_oauth_token", return_value=None):
+            out = plain(self.render(live_usage=True, drop=("rate_limits",)))
+        self.assertIn("5h 31%", out)
+        self.assertIn("7d --", out)
 
     def test_absent_context_window_shows_ctx_unknown(self):
         out = plain(self.render(drop=("context_window",)))
@@ -1215,10 +1387,100 @@ class MainRendering(TempClaudeDir, unittest.TestCase):
         self.assertNotIn("Claude | --", out)
 
 
+class ConsoleHost(unittest.TestCase):
+    """console_host(chain, windows): which console a Windows process really sits in.
+
+    Claude Code spawns the status line with no console window and no WT_SESSION, in Windows
+    Terminal just as in the classic console, so the verdict comes from the ancestors' windows.
+    """
+
+    CHAIN = [40, 30, 20, 10]  # python <- claude.exe <- pwsh.exe <- explorer.exe
+
+    def test_claude_session_in_windows_terminal_as_default_terminal(self):
+        windows = {20: [("PseudoConsoleWindow", True)], 10: [("Shell_TrayWnd", True), ("Progman", True)]}
+        self.assertEqual(sl.console_host(self.CHAIN, windows), "pty")
+
+    def test_claude_session_in_a_classic_console_window(self):
+        windows = {20: [("ConsoleWindowClass", True)], 10: [("Progman", True)]}
+        self.assertEqual(sl.console_host(self.CHAIN, windows), "classic")
+
+    def test_windows_terminal_tab(self):
+        windows = {20: [("PseudoConsoleWindow", True)], 10: [("CASCADIA_HOSTING_WINDOW_CLASS", True)]}
+        self.assertEqual(sl.console_host(self.CHAIN, windows), "pty")
+
+    def test_the_nearest_console_window_decides(self):
+        # cmd.exe opened a classic window from a Windows Terminal shell: python <- cmd <- pwsh
+        windows = {30: [("ConsoleWindowClass", True)], 20: [("PseudoConsoleWindow", True)]}
+        self.assertEqual(sl.console_host(self.CHAIN, windows), "classic")
+
+    def test_no_console_window_anywhere_is_no_verdict(self):
+        self.assertIsNone(sl.console_host(self.CHAIN, {10: [("Progman", True)]}))
+        self.assertIsNone(sl.console_host(self.CHAIN, {}))
+        self.assertIsNone(sl.console_host([], {}))
+
+    def test_hidden_console_windows_do_not_count(self):
+        windows = {30: [("ConsoleWindowClass", False)], 20: [("PseudoConsoleWindow", True)]}
+        self.assertEqual(sl.console_host(self.CHAIN, windows), "pty")
+
+
+class Demo(TempClaudeDir, unittest.TestCase):
+    """--demo prints two realistic sample lines at the window's width and touches no cache."""
+
+    def demo(self, icons="none", columns=120, theme=None):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        buf = io.StringIO()
+        env = {"COLUMNS": str(columns), "WT_SESSION": "x", "STATUSLINE_LIVE_USAGE": "1"}
+        if theme:
+            env["STATUSLINE_THEME"] = theme
+        with mock.patch.object(sys, "argv", ["statusline.py", "--demo", "--icons", icons]), \
+                mock.patch.dict(os.environ, env), redirect_stdout(buf), \
+                mock.patch.object(sl, "maybe_refresh", side_effect=AssertionError("network")), \
+                mock.patch.object(sl, "load_usage_cache", side_effect=AssertionError("usage cache read")), \
+                self.assertRaises(SystemExit) as leave:
+            sl.main()
+        self.assertEqual(leave.exception.code, 0)
+        return buf.getvalue().rstrip("\n").split("\n")
+
+    def test_two_lines_healthy_and_troubled(self):
+        healthy, troubled = [plain(x) for x in self.demo(columns=200)]
+        self.assertIn("claude-code-statusline › live-usage-and-redesign ~2", healthy)
+        self.assertIn("✓ mcp", healthy)
+        self.assertIn("▲ discord", troubled)
+        self.assertIn("↑ 2.", troubled)
+        self.assertIn("“statusline-py-usage-accuracy”", troubled)
+        for line in (healthy, troubled):
+            self.assertLessEqual(sl.visible_width(line), 196, line)
+            for want in ("ctx ", "5h ", "7d ", "$", "Opus"):
+                self.assertIn(want, line)
+
+    def test_at_120_columns_the_branch_survives_squeezed(self):
+        healthy, troubled = [plain(x) for x in self.demo()]
+        # The project stays whole at 120; the branch is cut or gone.
+        self.assertRegex(healthy, r"^claude-code-statusline( › live-\S*…)? │ Opus 4\.6 · high │ ctx 43% █████ 430k/1M │ 5h 74% █████ →2h")
+        # the long session name and two problems do not fit next to the meters: the problems fold into the marker
+        self.assertTrue(troubled.endswith(("▲", "▲discord")), troubled)
+        self.assertTrue(troubled.startswith("claude-code-statusline │ Opus 4.6 · high │ ctx 43%"), troubled)
+        for line in (healthy, troubled):
+            self.assertLessEqual(sl.visible_width(line), 116, line)
+
+    def test_demo_fits_any_width_in_both_icon_sets(self):
+        for icons in ("none", "nerd"):
+            for columns in (60, 100, 120, 160, 200):
+                for line in self.demo(icons, columns):
+                    self.assertLessEqual(sl.visible_width(plain(line)), columns - sl.EDGE, (icons, columns, line))
+        self.assertIn(sl.NERD_ICONS["segment"], self.demo("nerd")[0])
+
+    def test_demo_touches_no_cache_file(self):
+        self.demo()
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [])
+
+
 class IconFallback(unittest.TestCase):
     """The classic Windows console (conhost) draws no Nerd Font glyphs: it gets plain icons."""
 
-    def classes(self, console_class, wt=False, term=None):
+    def icons(self, verdict, wt=False, term=None):
         from unittest import mock
         env = {k: v for k, v in os.environ.items() if k not in ("WT_SESSION", "TERM_PROGRAM")}
         env.update({"WT_SESSION": "x"} if wt else {})
@@ -1226,34 +1488,46 @@ class IconFallback(unittest.TestCase):
         stack = mock.patch.dict(os.environ, env, clear=True)
         stack.__enter__()
         self.addCleanup(stack.__exit__, None, None, None)
-        p = mock.patch.object(sl, "console_window_class", return_value=console_class)
-        p.start()
-        self.addCleanup(p.stop)
+        for name, value in (("_probe_console_host", verdict), ("name", "nt")):
+            p = mock.patch.object(sl if name != "name" else sl.os, name, **({"return_value": value} if name != "name" else {"new": value}))
+            p.start()
+            self.addCleanup(p.stop)
         return sl.effective_icons("nerd")
 
     def test_classic_console_gets_plain_icons(self):
-        self.assertEqual(self.classes("ConsoleWindowClass"), "none")
+        self.assertEqual(self.icons("classic"), "none")
 
     def test_windows_terminal_keeps_nerd_icons(self):
-        self.assertEqual(self.classes("PseudoConsoleWindow", wt=True), "nerd")
+        self.assertEqual(self.icons("pty"), "nerd")
+        self.assertEqual(self.icons("pty", wt=True), "nerd")
 
-    def test_no_console_window_with_windows_terminal_env_keeps_nerd_icons(self):
-        self.assertEqual(self.classes("", wt=True), "nerd")
+    def test_no_verdict_keeps_nerd_icons(self):
+        # A status line spawned by Claude Code has no console window of its own: that is not "classic".
+        self.assertEqual(self.icons(None), "nerd")
+        self.assertEqual(self.icons(None, wt=True), "nerd")
+        self.assertEqual(self.icons(None, term="vscode"), "nerd")
 
-    def test_no_console_window_and_no_terminal_hint_gets_plain_icons(self):
-        self.assertEqual(self.classes(""), "none")
-
-    def test_other_terminals_keep_nerd_icons(self):
-        self.assertEqual(self.classes("", term="vscode"), "nerd")
-        self.assertEqual(self.classes(None), "nerd")  # not Windows / unknown
+    def test_a_failing_probe_keeps_nerd_icons(self):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k not in ("WT_SESSION", "TERM_PROGRAM")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sl.os, "name", "nt"), \
+                mock.patch.object(sl, "_probe_console_host", side_effect=OSError("no ctypes")):
+            self.assertEqual(sl.effective_icons("nerd"), "nerd")
 
     def test_plain_request_is_never_upgraded(self):
-        self.assertEqual(self.classes("PseudoConsoleWindow", wt=True) and sl.effective_icons("none"), "none")
+        self.icons("pty", wt=True)
+        self.assertEqual(sl.effective_icons("none"), "none")
+
+    def test_not_windows_means_no_probe(self):
+        from unittest import mock
+        with mock.patch.object(sl.os, "name", "posix"), \
+                mock.patch.object(sl, "_probe_console_host", side_effect=AssertionError("probed")):
+            self.assertEqual(sl.effective_icons("nerd"), "nerd")
 
     def test_force_variable_wins(self):
         from unittest import mock
-        with mock.patch.dict(os.environ, {"STATUSLINE_FORCE_ICONS": "1"}), \
-                mock.patch.object(sl, "console_window_class", return_value="ConsoleWindowClass"):
+        with mock.patch.dict(os.environ, {"STATUSLINE_FORCE_ICONS": "1"}), mock.patch.object(sl.os, "name", "nt"), \
+                mock.patch.object(sl, "_probe_console_host", return_value="classic"):
             self.assertEqual(sl.effective_icons("nerd"), "nerd")
 
     def test_plain_glyphs_are_ones_consolas_and_cascadia_have(self):
@@ -1347,14 +1621,28 @@ class ProbeCache(unittest.TestCase):
             first = self.health(NOW)
             second = self.health(NOW + sl.HEALTH_TTL - 0.5)
             self.assertEqual(read.call_count, 1)
-            self.health(NOW + 1, session="s2")
             self.health(NOW + 1, project="elsewhere")
-            self.assertEqual(read.call_count, 3)
+            self.assertEqual(read.call_count, 2)
             self.health(NOW + sl.HEALTH_TTL + 0.1)
-            self.assertEqual(read.call_count, 4)
+            self.assertEqual(read.call_count, 3)
         self.assertEqual(sl.health_marks(*second[:4]), sl.health_marks(*first[:4]))  # JSON turns tuples to lists
-        self.assertEqual([plain(t) for t, _ in sl.health_marks(*first[:4])], ["mcp 1 ✓", "CC 2.1.296"])
+        self.assertEqual([plain(t) for t, _, _ in sl.health_marks(*first[:4])], ["✓ mcp 1 · 2.1.296"])
         self.assertEqual(first[4], 7)
+
+    def test_sessions_of_one_project_share_the_mcp_log_scan(self):
+        from unittest import mock
+        logs = {"plugin-x-x": [{"debug": "Successfully connected", "sessionId": "s1", "timestamp": "1"},
+                               {"error": "Connection failed (x)", "sessionId": "s2", "timestamp": "2"}]}
+        with mock.patch.object(sl, "read_mcp_logs", return_value=logs) as read, \
+                mock.patch.object(sl, "count_skills", return_value=0):
+            one = self.health(NOW, session="s1")
+            two = self.health(NOW + 1, session="s2")
+            three = self.health(NOW + 2, session="s3")
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(list(one[3]), [["x"], []])
+        self.assertEqual(list(two[3]), [[], ["x"]])
+        self.assertEqual(list(three[3]), [[], []])  # no connection events of its own: nothing to show
+        self.assertIn("mcplogs:", "".join(self.entries()))
 
     def test_skill_count_lives_longer_than_the_rest_of_health(self):
         from unittest import mock
@@ -1431,8 +1719,8 @@ class ProbeCache(unittest.TestCase):
 
     def test_newest_entry_per_key_wins_whoever_saves_last(self):
         older, newer = sl.ProbeCache(self.path, NOW), sl.ProbeCache(self.path, NOW + 1)
-        older.get("k", 10, lambda: ["old"])
-        newer.get("k", 10, lambda: ["new"])
+        older.put("k", ["old"])
+        newer.put("k", ["new"])
         newer.save()
         older.save()
         self.assertEqual(self.entries()["k"]["v"], ["new"])
@@ -1459,9 +1747,8 @@ class ProbeCache(unittest.TestCase):
             return real(src, dst)
 
         cache = sl.ProbeCache(self.path, NOW)
-        cache.get("k", 10, lambda: ["v"])
         with mock.patch.object(sl.os, "replace", flaky):
-            cache.save()
+            cache.get("k", 10, lambda: ["v"])  # a claimed compute saves at once
         self.assertEqual(len(calls), 3)
         self.assertEqual(self.entries()["k"]["v"], ["v"])
         self.assertEqual([p.name for p in self.dir.glob("*.tmp")], [])
@@ -1495,10 +1782,66 @@ class ProbeCache(unittest.TestCase):
         again = sl.ProbeCache(self.path, NOW + 40)
         self.assertEqual(again.get("k", 10, lambda: ["fresh"]), ["fresh"])
 
-    def test_a_missing_key_is_computed_even_if_claimed(self):
+    def test_a_missing_key_is_computed_once_another_sessions_claim_leads_nowhere(self):
+        from unittest import mock
         claim = pathlib.Path(f"{self.path}.{sl.zlib.crc32(b'k'):08x}.claim")
         claim.write_bytes(b"")
-        self.assertEqual(sl.ProbeCache(self.path, NOW).get("k", 10, lambda: ["v"]), ["v"])
+        with mock.patch.object(sl.ProbeCache, "CLAIM_WAIT", 0.05):
+            start = time.monotonic()
+            self.assertEqual(sl.ProbeCache(self.path, NOW).get("k", 10, lambda: ["v"]), ["v"])
+        self.assertGreaterEqual(time.monotonic() - start, 0.04)  # it waited for the other session first
+        self.assertTrue(claim.exists())  # and left the live claim alone
+
+    def test_two_sessions_racing_on_a_missing_key_compute_it_once(self):
+        import threading
+        computed = []
+        started = threading.Event()
+
+        def slow():
+            started.set()
+            time.sleep(0.08)
+            computed.append(1)
+            return ["fresh"]
+
+        results = {}
+
+        def session(name, compute):
+            results[name] = sl.ProbeCache(self.path, NOW).get("k", 10, compute)
+
+        a = threading.Thread(target=session, args=("a", slow))
+        a.start()
+        started.wait()
+        b = threading.Thread(target=session, args=("b", lambda: computed.append(2) or ["dup"]))
+        b.start()
+        a.join()
+        b.join()
+        self.assertEqual(computed, [1])
+        self.assertEqual(results, {"a": ["fresh"], "b": ["fresh"]})
+
+    def test_a_won_claim_rereads_the_file_before_computing(self):
+        # Between this session's load and its claim, another session stored the value.
+        mine = sl.ProbeCache(self.path, NOW)
+        other = sl.ProbeCache(self.path, NOW)
+        other.get("k", 10, lambda: ["theirs"])
+        other.save()
+        self.assertEqual(mine.get("k", 10, lambda: self.fail("recomputed")), ["theirs"])
+
+    def test_a_computed_value_is_on_disk_as_soon_as_the_claim_is_released(self):
+        cache = sl.ProbeCache(self.path, NOW)
+        cache.get("k", 10, lambda: ["v"])
+        self.assertEqual(self.entries()["k"]["v"], ["v"])
+        self.assertEqual(list(self.dir.glob("*.claim")), [])
+
+    def test_entries_keep_their_own_ttl_in_the_file(self):
+        cache = sl.ProbeCache(self.path, NOW)
+        cache.get("long", 3600, lambda: ["l"])
+        cache.get("short", 3, lambda: ["s"])
+        cache.save()
+        later = sl.ProbeCache(self.path, NOW + 120)
+        later.get("other", 10, lambda: ["o"])
+        later.save()
+        self.assertEqual(set(self.entries()), {"long", "other"})
+        self.assertEqual(later.get("long", 3600, lambda: self.fail("recomputed")), ["l"])
 
 
 class CachedRendering(TempClaudeDir, unittest.TestCase):
@@ -1621,20 +1964,41 @@ class CheapWins(unittest.TestCase):
             fake = mock.MagicMock()
             with mock.patch.dict(os.environ, {var: "x"}), mock.patch.dict(sys.modules, {"ctypes": fake}), \
                     mock.patch.object(sl.os, "name", "nt"):
-                got = sl.console_window_class()
+                got = sl.terminal_kind()
             self.assertEqual(fake.mock_calls, [], var)
             self.assertIsNone(got)
             with mock.patch.dict(os.environ, {var: "x"}):
                 self.assertEqual(sl.effective_icons("nerd"), "nerd")
 
-    def test_ctypes_is_still_asked_without_a_terminal_hint(self):
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_the_real_probe_runs_in_a_few_milliseconds_and_returns_a_verdict_or_none(self):
+        start = time.perf_counter()
+        got = sl._probe_console_host()
+        self.assertLess(time.perf_counter() - start, 0.2)
+        self.assertIn(got, ("classic", "pty", None))
+
+    def test_the_console_verdict_is_asked_once_per_parent_and_kept_an_hour(self):
+        import tempfile
         from unittest import mock
-        fake = mock.MagicMock()
-        fake.windll.kernel32.GetConsoleWindow.return_value = 0
         env = {k: v for k, v in os.environ.items() if k not in ("WT_SESSION", "TERM_PROGRAM")}
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules, {"ctypes": fake}), \
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sl, "_probe_console_host", return_value="classic") as probe, \
                 mock.patch.object(sl.os, "name", "nt"):
-            self.assertEqual(sl.console_window_class(), "")
+            path = os.path.join(tmp, sl.PROBE_CACHE_NAME)
+            first = sl.ProbeCache(path, NOW)
+            self.assertEqual(sl.effective_icons("nerd", first), "none")
+            first.save()
+            later = sl.ProbeCache(path, NOW + 3000)
+            self.assertEqual(sl.effective_icons("nerd", later), "none")
+            self.assertEqual(probe.call_count, 1)
+            with open(path, encoding="utf-8") as f:
+                self.assertIn(f"console:{os.getppid()}", f.read())
+            expired = sl.ProbeCache(path, NOW + sl.CONSOLE_TTL + 1)
+            self.assertEqual(sl.effective_icons("nerd", expired), "none")
+            self.assertEqual(probe.call_count, 2)
+            with mock.patch.dict(os.environ, {"WT_SESSION": "x"}):
+                self.assertEqual(sl.effective_icons("nerd", later), "nerd")  # the env still wins, no probe needed
+            self.assertEqual(probe.call_count, 2)
 
     def test_port_probe_waits_20ms(self):
         import inspect
@@ -1673,6 +2037,238 @@ class StandaloneRun(TempClaudeDir, unittest.TestCase):
         self.assertLessEqual(sl.visible_width(out), 120 - sl.EDGE)
         for want in ("my-special-proj", "Opus 5.5", "ctx 43%", "5h 74%", "7d 69%", "35.50"):
             self.assertIn(want, out)
+
+
+class Utf8Everywhere(TempClaudeDir, unittest.TestCase):
+    """stdin and git output are UTF-8 whatever the console code page says."""
+
+    def test_hebrew_and_accents_render_under_a_cp1252_console(self):
+        import json
+        import subprocess
+        proj = self.proj.parent / "פרויקט-café"
+        proj.mkdir()
+        data = dict(SingleLine.DATA, workspace={"current_dir": str(proj)}, session_name="משימה naïve")
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.dir), STATUSLINE_LIVE_USAGE="0", COLUMNS="200",
+                   WT_SESSION="x", PYTHONIOENCODING="cp1252")
+        r = subprocess.run([sys.executable, "-S", sl.__file__], input=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                           capture_output=True, env=env, timeout=20)
+        out = plain(r.stdout.decode("utf-8").rstrip("\r\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("פרויקט-café", out)
+        self.assertIn("“משימה-naïve”", out)
+
+    def test_stdin_without_a_buffer_is_still_read(self):
+        out = plain(self.render(columns=200, data_update={"session_name": "Caf\u00e9"}))  # StringIO stdin
+        self.assertIn("“café”", out)
+
+
+class GitOutputEncoding(unittest.TestCase):
+    def test_git_output_is_decoded_as_utf8(self):
+        from unittest import mock
+        with mock.patch("subprocess.run") as run:
+            sl.run(["git", "status"])
+        self.assertEqual(run.call_args.kwargs.get("encoding"), "utf-8")
+        self.assertEqual(run.call_args.kwargs.get("errors"), "replace")
+
+
+class LineWidth(unittest.TestCase):
+    def width_for(self, columns):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k != "COLUMNS"}
+        if columns is not None:
+            env["COLUMNS"] = columns
+        with mock.patch.dict(os.environ, env, clear=True):
+            return sl.line_width()
+
+    def test_narrow_windows_are_clamped_not_unlimited(self):
+        self.assertEqual(self.width_for("21"), 20)
+        self.assertEqual(self.width_for("24"), 20)
+        self.assertEqual(self.width_for("10"), 20)
+        self.assertEqual(self.width_for("120"), 116)
+
+    def test_unknown_or_invalid_width_means_unlimited(self):
+        for columns in (None, "", "0", "-5", "abc"):
+            self.assertIsNone(self.width_for(columns), columns)
+
+    def test_long_model_names_are_cut_in_the_middle(self):
+        data = {"model": {"display_name": "Claude Opus 4.1 Experimental Preview Build"}}
+        out = plain(sl.format_statusline(data, now=NOW, show_usage=False))
+        head = out.split(" │ ")[0]
+        self.assertLessEqual(len(head), 20)
+        self.assertIn("…", head)
+        self.assertTrue(head.startswith("Claude Op"), head)
+
+    def test_no_width_overflows_for_a_grid_of_payloads(self):
+        names = ["Opus 5.5", "Claude Sonnet 4.6 Preview Experimental Build", "X"]
+        efforts = [None, "max"]
+        pcts = [(0, 0, 0), (100, 100, 100), (43, 74, 69)]
+        marks = [[], [("▲ discord +2", sl.FAILED, "discord"), ("↑ 2.2.0", sl.UPDATE, "2.2.0")]]
+        count = 0
+        for name in names:
+            for effort in efforts:
+                for ctx, five, seven in pcts:
+                    data = {"model": {"display_name": name}, "effort": {"level": effort} if effort else None,
+                            "context_window": {"used_percentage": ctx, "context_window_size": 1_000_000,
+                                               "current_usage": {"input_tokens": ctx * 10_000}},
+                            "cost": {"total_cost_usd": 1234.5, "total_duration_ms": 10 * HOUR * 1000}}
+                    usage = sl.merge_usage({}, live(five=(five, NOW + HOUR), seven=(seven, NOW + 3 * 24 * HOUR)), NOW)
+                    for m in marks:
+                        extras = {"proj": "claude-code-statusline", "git": ("live-usage-and-redesign", ["~2"]),
+                                  "name": "statusline-py-usage-accuracy", "skills": 69, "marks": m,
+                                  "ports": ":3000", "venv": "venv:x"}
+                        for width in range(40, 301, 7):
+                            out = sl.format_statusline(data, usage, NOW, True, extras, width)
+                            count += 1
+                            self.assertNotIn("\n", out)
+                            # the floor: model (8), three percentages and their countdowns, 47 columns at 100%
+                            self.assertLessEqual(sl.visible_width(out), max(width, 47), (name, effort, ctx, width, plain(out)))
+                            if width < 47:
+                                self.assertRegex(plain(out), r"^.{1,8}( · \S+)? │ ctx \d+% │ 5h \d+%( →\S+)? │ 7d \d+%( →\S+)?( │ \S+)?$")
+        self.assertGreater(count, 200)
+
+
+class TerminalCells(unittest.TestCase):
+    """visible_width counts terminal cells, not code points."""
+
+    def test_ascii_and_colors(self):
+        self.assertEqual(sl.visible_width(f"{sl.GREEN}abc{sl.RST} d"), 5)
+
+    def test_wide_and_fullwidth_characters_take_two_cells(self):
+        self.assertEqual(sl.visible_width("日本語"), 6)
+        self.assertEqual(sl.visible_width("Ａ"), 2)  # fullwidth A
+        self.assertEqual(sl.visible_width("x\U0001F600y"), 4)  # emoji
+
+    def test_zero_width_characters_take_none(self):
+        self.assertEqual(sl.visible_width("e\u0301"), 1)  # combining acute
+        self.assertEqual(sl.visible_width("a\u200bb\u200d"), 2)
+        self.assertEqual(sl.visible_width("\u2713\ufe0f"), 2)  # check mark in emoji presentation
+        self.assertEqual(sl.visible_width("\u2713"), 1)  # text presentation: one cell
+
+    def test_hebrew_and_nerd_glyphs_are_one_cell(self):
+        self.assertEqual(sl.visible_width("שלום"), 4)
+        # private-use glyphs are one cell each (the bar segment is two glyphs)
+        self.assertEqual(sl.visible_width(sl.NERD_ICONS["segment"] + sl.NERD_ICONS["warn"]), 3)
+
+    def test_unicodedata_is_not_imported_for_ascii(self):
+        from unittest import mock
+        with mock.patch.dict(sys.modules, {"unicodedata": None}):  # import would raise ImportError
+            self.assertEqual(sl.visible_width(f"{sl.DIM}plain ascii │ ok{sl.RST}".replace("│", "|")), 16)
+
+
+class SmallBugs(unittest.TestCase):
+    def test_mcp_log_dir_key_keeps_only_ascii_alphanumerics(self):
+        root = sl.mcp_log_root("C:\\dev\\פרויקט café_1")  # six Hebrew letters, a space, an accent, an underscore
+        self.assertTrue(root.endswith("C--dev--------caf--1"), root)
+
+    def test_malformed_percentages_count_as_missing(self):
+        for bad in ("n/a", "", [74], None, float("nan")):
+            self.assertIsNone(sl._window(bad, NOW + HOUR, NOW), bad)
+        got = sl.merge_usage({"five_hour": 5, "seven_day": {"used_percentage": "", "resets_at": NOW + HOUR}}, None, NOW)
+        self.assertEqual(got, {"five_hour": None, "seven_day": None})
+        out = plain(sl.format_statusline({"model": {"display_name": "Opus"}}, usage=got, now=NOW))
+        self.assertIn("5h -- │ 7d --", out)
+
+    def test_null_display_name_falls_back_to_claude(self):
+        for model in ({"display_name": None}, {}, None):
+            out = plain(sl.format_statusline({"model": model}, now=NOW, show_usage=False))
+            self.assertTrue(out.startswith("Claude │"), out)
+
+    def test_oauth_token_is_none_for_any_bad_credentials_file(self):
+        import json
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            creds = pathlib.Path(tmp) / ".credentials.json"
+            with mock.patch.object(sl, "CLAUDE_DIR", tmp), mock.patch.object(sl, "run", return_value=""):
+                for text in ('{"claudeAiOauth": null}', '{"claudeAiOauth": {"accessToken": "t", "expiresAt": "soon"}}',
+                             '{"claudeAiOauth": []}', "not json", ""):
+                    creds.write_text(text, encoding="utf-8")
+                    self.assertIsNone(sl.read_oauth_token(), text)
+                creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "tok", "expiresAt": 9e15}}), encoding="utf-8")
+                self.assertEqual(sl.read_oauth_token(), "tok")
+
+    def test_plugins_without_an_install_path_are_skipped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "skills" / "here").mkdir(parents=True)
+            (root / "skills" / "here" / "SKILL.md").write_text("x")
+            installed = {"plugins": {"p@m": [{}], "q@m": [{"installPath": None}]}}
+            cwd = os.getcwd()
+            os.chdir(tmp)  # a glob of "" would count the cwd's skills
+            try:
+                self.assertEqual(sl.count_skills(installed, {"p@m", "q@m"}, root / "nowhere"), 0)
+            finally:
+                os.chdir(cwd)
+
+
+class UsageLockTakeover(TempClaudeDir, unittest.TestCase):
+    def stale_lock(self):
+        sl.USAGE_LOCK.write_text("dead", encoding="utf-8")
+        os.utime(sl.USAGE_LOCK, (time.time() - 120, time.time() - 120))
+
+    def test_a_stale_lock_is_taken_over(self):
+        self.stale_lock()
+        self.assertTrue(sl._take_lock(time.time(), "me"))
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "me")
+        self.assertEqual([p.name for p in self.dir.iterdir() if "lock" in p.name], [sl.USAGE_LOCK.name])
+
+    def test_a_fresh_lock_is_respected(self):
+        sl.USAGE_LOCK.write_text("busy", encoding="utf-8")
+        self.assertFalse(sl._take_lock(time.time(), "me"))
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "busy")
+
+    def test_losing_the_takeover_race_leaves_the_winners_lock_alone(self):
+        from unittest import mock
+        self.stale_lock()
+        def someone_else_first(src, dst):
+            # Between our stat and our move, another session moved the stale lock away and made its own.
+            sl.USAGE_LOCK.write_text("winner", encoding="utf-8")
+            raise FileNotFoundError(src)
+
+        with mock.patch.object(sl.os, "replace", someone_else_first):
+            self.assertFalse(sl._take_lock(time.time(), "me"))
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "winner")
+
+
+class FastLaunch(TempClaudeDir, unittest.TestCase):
+    """main() is importable: python -S -c "...import statusline; statusline.main()" --icons nerd."""
+
+    def test_import_form_matches_the_script_form_and_reuses_its_pycache(self):
+        import json
+        import shutil
+        import subprocess
+        home = self.proj.parent / "home"
+        home.mkdir()
+        shutil.copy(sl.__file__, home / "statusline.py")
+        data = dict(SingleLine.DATA, workspace={"current_dir": str(self.proj)},
+                    rate_limits={"five_hour": {"used_percentage": 74, "resets_at": 9e9}})
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.dir), STATUSLINE_LIVE_USAGE="0", COLUMNS="120",
+                   WT_SESSION="x", PYTHONIOENCODING="utf-8")
+        fast = [sys.executable, "-S", "-c",
+                f"import os,sys;sys.path.insert(0,{str(home)!r});import statusline;statusline.main()", "--icons", "nerd"]
+        script = [sys.executable, "-S", str(home / "statusline.py"), "--icons", "nerd"]
+        outs = []
+        for cmd in (fast, fast, script):
+            r = subprocess.run(cmd, input=json.dumps(data), capture_output=True, text=True, encoding="utf-8",
+                               env=env, timeout=20, cwd=str(self.proj))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stderr, "")
+            outs.append(r.stdout)
+            pyc = list((home / "__pycache__").glob("statusline.*.pyc"))
+            self.assertEqual(len(pyc), 1, pyc)
+            outs.append(pyc[0].stat().st_mtime_ns)
+        self.assertEqual(outs[0], outs[2])
+        self.assertEqual(outs[0], outs[4])  # the script form renders the very same line
+        self.assertEqual(outs[1], outs[3])  # the second launch reused the compiled module
+        self.assertIn(sl.NERD_ICONS["segment"], outs[0])
+        self.assertIn("5h 74%", plain(outs[0]))
+
+    def test_refresh_child_is_spawned_from_the_module_file(self):
+        from unittest import mock
+        with mock.patch("subprocess.Popen") as popen, mock.patch.object(sys, "argv", ["-c", "--icons", "nerd"]):
+            sl.maybe_refresh({}, NOW)
+        self.assertEqual(popen.call_args.args[0][1], os.path.abspath(sl.__file__))
 
 
 class RefreshProcess(TempClaudeDir, unittest.TestCase):
