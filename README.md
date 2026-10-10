@@ -17,15 +17,16 @@ This is one Python file that gives you vital session info everywhere and quietly
 
 | Section | Meaning |
 |---|---|
-| **model · effort** | Model display name, then the reasoning effort level (low → max) when set |
+| **model · effort** | Model display name, colored by family (Opus orange, Sonnet blue, Haiku teal, Fable pink), then the reasoning effort level (low → max) when set |
 | **ctx ▰▰▱▱ N% used/size** | Context window usage as a percentage and in tokens — shifts green → amber → red as it fills |
 | **5h / 7d** | Plan usage for both windows, account-wide (see below), plus time until each window resets. `--` until the first reading arrives |
-| **$X.XX** | Session cost in USD |
+| **$X.XX** | Session cost in USD (bold green) |
 | **duration** | Session wall-clock time |
 | **project › git** | Working directory name, then branch + dirty counts: `+staged ~modified ?untracked`. Branch is green when clean, amber when dirty |
 | **cc** *(line 2)* | Claude Code version: `✓` up to date, `↑ X` newer release on your update channel, `↑ X restart` already installed and waiting for a restart |
 | **plugins** *(line 2)* | `✓`, or `↑ N /reload-plugins` when N enabled plugins were updated on disk after this session loaded them |
 | **mcp** *(line 2)* | MCP servers connected in this session; `▲ name` for any that failed to connect (read from Claude Code's per-session MCP logs, no extra connections) |
+| **agents** *(line 3, off by default: `SHOW_AGENTS = True`)* | Each running subagent: type and model in the model's color, effort, and context tokens. Up to 3, then `+N` |
 | **venv** | Active Python virtualenv or conda environment |
 | **:ports** | Common dev ports currently listening (3000, 5173, 8000, 8080, 9086, …) |
 
@@ -34,6 +35,16 @@ Every section after `model` and `ctx` is auto-detected — a Rust repo with no v
 ## Install
 
 **Requirements:** Python 3.10+, a terminal that supports 256-color (Windows Terminal, iTerm2, macOS Terminal, modern Gnome Terminal — all fine out of the box). No Nerd Font needed: every glyph is in stock Cascadia, Menlo and DejaVu.
+
+### Icons (optional)
+
+With a [Nerd Font](https://www.nerdfonts.com/) set as your terminal font (e.g. *CaskaydiaMono Nerd Font*, the Cascadia you already have plus icons), add `--icons nerd` to the command:
+
+```json
+"command": "python ~/.claude/statusline.py --icons nerd"
+```
+
+`STATUSLINE_ICONS=nerd` works too. Without it the bar uses plain text, so nothing renders as boxes.
 
 ### 1. Drop the file
 
@@ -58,7 +69,7 @@ Edit `~/.claude/settings.json` and add:
   "statusLine": {
     "type": "command",
     "command": "python ~/.claude/statusline.py",
-    "refreshInterval": 30
+    "refreshInterval": 10
   }
 }
 ```
@@ -76,8 +87,9 @@ New session, new bar.
 Everything lives in the top of `statusline.py`.
 
 - **Ports** — edit `COMMON_PORTS` to match your stack.
-- **Colors** — tweak the 256-color constants (`MODEL`, `PROJECT`, `GREEN`, `AMBER`, `CYAN`) and the `RAMP` used for percentages.
-- **Health line** — set `SHOW_HEALTH = False` to keep a single line.
+- **Colors** — tweak the 256-color constants (`MODEL`, `PROJECT`, `GREEN`, `AMBER`, `CYAN`) and the `STAGES` / `RED` used for percentages (green, yellow from 50%, orange from 70%, red from 85%).
+- **Extra lines** — `SHOW_HEALTH = False` / `SHOW_AGENTS = False` turn off the health and subagent lines.
+- **Model colors** — `MODEL_COLORS` maps model families to colors.
 - **Usage refresh** — `USAGE_TTL` sets how often live usage is fetched (default 60 s). `STATUSLINE_LIVE_USAGE=0` turns live fetching off.
 - **Sections** — add your own by appending to `parts` in `format_statusline()`.
 
