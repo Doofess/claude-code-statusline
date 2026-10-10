@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import unittest
+from unittest import mock
 
 import statusline as sl
 
@@ -2364,6 +2365,123 @@ class RefreshProcess(TempClaudeDir, unittest.TestCase):
         self.assertLess(time.monotonic() - start, 10, r.stderr)
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(sl.USAGE_LOCK.exists())
+
+
+class InstallCommand(unittest.TestCase):
+    """`statusline.py install` / `uninstall` (and the claude-statusline entry point that calls main())."""
+
+    def setUp(self):
+        import json
+        import tempfile
+        self.json = json
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = pathlib.Path(self.tmp.name) / "claude"
+        self.dir.mkdir()
+        self.settings = self.dir / "settings.json"
+
+    def run_cli(self, *args):
+        argv = ["statusline.py", *args, "--claude-dir", str(self.dir)]
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as shown:
+            code = sl.main()
+        return code, "\n".join(str(c.args[0]) for c in shown.call_args_list if c.args)
+
+    def load(self):
+        return self.json.loads(self.settings.read_text(encoding="utf-8"))
+
+    def test_install_copies_the_script_and_sets_the_status_line_keeping_other_settings(self):
+        self.settings.write_text(self.json.dumps({"model": "opus", "env": {"A": "1"}}), encoding="utf-8")
+        code, out = self.run_cli("install", "--icons", "none", "--no-test")
+        self.assertEqual(code, 0, out)
+        data = self.load()
+        self.assertEqual((data["model"], data["env"]), ("opus", {"A": "1"}))
+        line = data["statusLine"]
+        self.assertEqual((line["type"], line["refreshInterval"]), ("command", 1))
+        self.assertIn(" -S -c ", line["command"])
+        self.assertIn("statusline.main()", line["command"])
+        self.assertNotIn("--icons", line["command"])
+        self.assertTrue((self.dir / "statusline.py").is_file())
+        self.assertEqual(len(list((self.dir / "backups").glob("statusline-*/settings.json"))), 1)
+
+    def test_nerd_icons_add_the_flag_and_the_command_points_at_a_custom_dir(self):
+        code, out = self.run_cli("install", "--icons", "nerd", "--no-test")
+        self.assertEqual(code, 0, out)
+        command = self.load()["statusLine"]["command"]
+        self.assertTrue(command.endswith(" --icons nerd"))
+        self.assertIn(str(self.dir).replace("\\", "/"), command)
+
+    def test_the_default_dir_is_written_as_tilde_claude(self):
+        command = sl._launch_command("python", os.path.join(sl.HOME, ".claude"), "nerd")
+        self.assertIn("expanduser('~/.claude')", command)
+        self.assertTrue(command.startswith('python -S -c "'))
+
+    def test_installing_twice_keeps_the_original_status_line_for_uninstall(self):
+        before = {"type": "command", "command": "my-own-line"}
+        self.settings.write_text(self.json.dumps({"statusLine": before}), encoding="utf-8")
+        self.assertEqual(self.run_cli("install", "--icons", "none", "--no-test")[0], 0)
+        self.assertEqual(self.run_cli("install", "--icons", "none", "--no-test")[0], 0)
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        self.assertEqual(self.load()["statusLine"], before)
+        self.assertFalse((self.dir / "statusline.py").exists())
+        self.assertFalse((self.dir / sl.INSTALL_RECORD).exists())
+
+    def test_uninstall_without_a_previous_line_removes_ours_only(self):
+        self.settings.write_text(self.json.dumps({"model": "opus"}), encoding="utf-8")
+        self.run_cli("install", "--icons", "none", "--no-test")
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        self.assertEqual(self.load(), {"model": "opus"})
+
+    def test_uninstall_leaves_a_foreign_status_line_alone(self):
+        self.settings.write_text(self.json.dumps({"statusLine": {"command": "other-tool"}}), encoding="utf-8")
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.load(), {"statusLine": {"command": "other-tool"}})
+        self.assertIn("left settings.json alone", out)
+
+    def test_an_unparseable_settings_file_is_never_touched(self):
+        self.settings.write_text("{ not json", encoding="utf-8")
+        code, out = self.run_cli("install", "--icons", "none", "--no-test")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.settings.read_text(encoding="utf-8"), "{ not json")
+        self.assertFalse((self.dir / "statusline.py").exists())
+        self.assertIn("nothing was changed", out)
+
+    def test_dry_run_writes_nothing(self):
+        code, out = self.run_cli("install", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [])
+        self.assertIn("statusLine.command", out)
+
+    def test_a_bad_icons_value_prints_usage_and_changes_nothing(self):
+        code, out = self.run_cli("install", "--icons", "wild")
+        self.assertEqual(code, 2)
+        self.assertIn("Usage:", out)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [])
+
+    def test_a_bom_in_settings_is_read_and_the_file_written_back_without_one(self):
+        self.settings.write_bytes(b"\xef\xbb\xbf" + self.json.dumps({"model": "x"}).encode())
+        self.assertEqual(self.run_cli("install", "--icons", "none", "--no-test")[0], 0)
+        self.assertFalse(self.settings.read_bytes().startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(self.load()["model"], "x")
+
+    def test_the_self_test_runs_the_installed_command_and_a_failure_rolls_settings_back(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.dir)}):
+            code, out = self.run_cli("install", "--icons", "none")
+        self.assertEqual(code, 0, out)
+        self.assertIn("self-test ok", out)
+        self.settings.write_text(self.json.dumps({"model": "x"}), encoding="utf-8")
+        with mock.patch.object(sl, "_smoke_test", return_value=(False, "boom")):
+            code, out = self.run_cli("install", "--icons", "none")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.load(), {"model": "x"})
+        self.assertIn("put back", out)
+
+    def test_script_is_runnable_as_python_dash_s_install_help(self):
+        import subprocess
+        r = subprocess.run([sys.executable, "-S", sl.__file__, "install", "--help"], capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("claude-statusline install", r.stdout)
 
 
 if __name__ == "__main__":

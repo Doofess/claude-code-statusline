@@ -79,6 +79,35 @@ The classic Windows console host cannot draw Nerd Font glyphs, so `nerd` falls b
 
 **Requirements:** Python 3.10 or newer, a terminal with 256 colours (Windows Terminal, iTerm2, macOS Terminal, GNOME Terminal). No Nerd Font needed.
 
+### One command
+
+With [uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/) on the machine (macOS, Linux and Windows):
+
+```bash
+uvx --from git+https://github.com/Doofess/claude-code-statusline claude-statusline install
+# or
+pipx run --spec git+https://github.com/Doofess/claude-code-statusline claude-statusline install
+```
+
+It copies `statusline.py` to `~/.claude`, backs up `settings.json` (to `~/.claude/backups/statusline-<time>/`), sets `statusLine` to the fast launch below with `refreshInterval` 1, renders a sample line as a self-test, and puts everything back if that test fails. Nothing stays installed in uv or pipx: the status line is the one copied file, so a render never pays for a package wrapper. Restart Claude Code afterwards.
+
+| Flag | Effect |
+| --- | --- |
+| `--icons auto` (default) | Nerd icons when a Nerd Font file is installed, plain otherwise. `nerd` and `none` force one. |
+| `--dry-run` | Print what it would do; write nothing. |
+| `--no-test` | Skip the self-test. |
+| `--claude-dir PATH` | Another config directory (default `CLAUDE_CONFIG_DIR`, else `~/.claude`). |
+
+Run it again to update (it replaces the script and keeps your original `statusLine` for uninstall). To remove it:
+
+```bash
+uvx --from git+https://github.com/Doofess/claude-code-statusline claude-statusline uninstall
+```
+
+That restores the `statusLine` you had before, or removes ours, and deletes the copied script and its caches. It refuses to touch a `settings.json` that is not valid JSON.
+
+Without uv or pipx, `python statusline.py install` does the same from a clone, and the two manual steps below still work.
+
 ### 1. Drop the file
 
 ```bash

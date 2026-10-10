@@ -21,7 +21,11 @@ quota. The script also reads the endpoint behind /usage in a background process,
 caches it for USAGE_TTL seconds, and shows the higher of the two within a window.
 Set STATUSLINE_LIVE_USAGE=0 to turn that off.
 
-Install:
+Install, one command (uv or pipx; see the README for the repo URL):
+    uvx --from git+https://github.com/Doofess/claude-code-statusline claude-statusline install
+    (or `python statusline.py install`; `uninstall` undoes it; `--dry-run` shows the changes)
+
+Or by hand:
     1. Drop this file at ~/.claude/statusline.py
     2. Add to ~/.claude/settings.json:
            "statusLine": {
@@ -1709,8 +1713,244 @@ def _opt(args, name):
     return args[args.index(name) + 1] if name in args[:-1] else None
 
 
+# ---- install / uninstall -------------------------------------------------------------------------
+# `python statusline.py install`, or `claude-statusline install` when run from uvx / pipx. It copies this
+# file to the Claude config dir and points statusLine at it with the fast launch. Nothing here runs on a
+# normal render: main() dispatches on the first argument before any of it is used.
+
+INSTALL_RECORD = "statusline-install.json"  # remembers the statusLine an install replaced
+SAMPLE_PAYLOAD = {"model": {"display_name": "Test"}, "context_window": {"used_percentage": 12,
+                                                                        "context_window_size": 1000000}}
+INSTALL_USAGE = """\
+Usage: claude-statusline install [--icons auto|nerd|none] [--dry-run] [--no-test]
+       claude-statusline uninstall [--dry-run]
+  install    copy the script to ~/.claude and set statusLine (backs up settings.json first)
+  uninstall  restore the previous statusLine, or remove ours, and delete the copied script
+  --icons    nerd needs a Nerd Font in the terminal; auto picks nerd only when one is installed
+  --claude-dir PATH  use another config dir (default: CLAUDE_CONFIG_DIR or ~/.claude)
+"""
+
+
+def _find_python():
+    """The python command to write into settings: a name on PATH that is 3.10+, else this
+    interpreter when it is not a throwaway virtualenv (uvx and pipx run in one). None if neither."""
+    import shutil
+    import subprocess
+    names = ("python", "python3") if os.name == "nt" else ("python3", "python")
+    for name in names:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        try:
+            out = subprocess.run([exe, "-c", "import sys;print(int(sys.version_info>=(3,10)))"],
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+        except Exception:
+            continue
+        if out == "1":
+            return name
+    if sys.prefix == sys.base_prefix and sys.version_info >= (3, 10):
+        return f'"{sys.executable}"' if " " in sys.executable else sys.executable
+    return None
+
+
+def _has_nerd_font():
+    """True when a Nerd Font file is installed (not proof the terminal uses it)."""
+    home = HOME
+    dirs = [os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
+            os.path.join(os.environ.get("WINDIR", ""), "Fonts"),
+            os.path.join(home, "Library", "Fonts"), "/Library/Fonts",
+            os.path.join(home, ".local", "share", "fonts"), os.path.join(home, ".fonts"),
+            "/usr/share/fonts", "/usr/local/share/fonts"]
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for _root, _dirs, files in os.walk(d):
+            if any("nerd" in f.lower() for f in files):
+                return True
+    return False
+
+
+def _launch_command(python, claude_dir, icons):
+    """The statusLine command: python -S importing the copied module, so its compiled .pyc is reused."""
+    default = os.path.abspath(os.path.join(HOME, ".claude"))
+    where = "~/.claude" if os.path.abspath(claude_dir) == default else claude_dir.replace("\\", "/")
+    code = f"import os,sys;sys.path.insert(0,os.path.expanduser('{where}'));import statusline;statusline.main()"
+    return f'{python} -S -c "{code}"' + (" --icons nerd" if icons == "nerd" else "")
+
+
+def _read_settings(path):
+    """settings.json as a dict ({} when missing or empty); ValueError when it is not a JSON object."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return {}
+    if not text.strip():
+        return {}
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
+def _write_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _is_ours(status_line):
+    cmd = status_line.get("command") if isinstance(status_line, dict) else None
+    return isinstance(cmd, str) and "statusline" in cmd
+
+
+def _smoke_test(command):
+    """Run the settings command as Claude Code would, with a sample payload. (ok, output)."""
+    import subprocess
+    env = dict(os.environ, STATUSLINE_LIVE_USAGE="0")
+    try:
+        r = subprocess.run(command, shell=True, input=json.dumps(SAMPLE_PAYLOAD), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=30, env=env)
+    except Exception as e:
+        return False, str(e)
+    out = (r.stdout or "").strip()
+    return r.returncode == 0 and bool(out) and not out.startswith("Claude | --"), out or (r.stderr or "").strip()
+
+
+def install_main(args):
+    """install / uninstall. Returns the exit code; never edits a settings.json it cannot parse."""
+    import shutil
+    uninstall = args[0] == "uninstall"
+    if "-h" in args or "--help" in args:
+        print(INSTALL_USAGE, end="")
+        return 0
+    cdir = os.path.abspath(_opt(args, "--claude-dir") or CLAUDE_DIR)
+    dry = "--dry-run" in args
+    settings_path = os.path.join(cdir, "settings.json")
+    record_path = os.path.join(cdir, INSTALL_RECORD)
+    try:
+        settings = _read_settings(settings_path)
+    except (ValueError, OSError) as e:
+        print(f"statusline: cannot read {settings_path} ({e}); nothing was changed")
+        return 1
+    record = {}
+    try:
+        with open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        record = record if isinstance(record, dict) else {}
+    except (OSError, ValueError):
+        pass
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def backup():
+        if os.path.exists(settings_path) and not dry:
+            dest = os.path.join(cdir, "backups", f"statusline-{stamp}")
+            os.makedirs(dest, exist_ok=True)
+            shutil.copy2(settings_path, dest)
+            return dest
+        return None
+
+    if uninstall:
+        current = settings.get("statusLine")
+        if _is_ours(current):
+            previous = record.get("previous")
+            action = "restored the previous statusLine" if previous else "removed the statusLine"
+            if not dry:
+                backup()
+                if previous:
+                    settings["statusLine"] = previous
+                else:
+                    settings.pop("statusLine", None)
+                _write_json(settings_path, settings)
+        else:
+            action = "left settings.json alone (its statusLine is not this one)"
+        if not dry:
+            for name in ("statusline.py", INSTALL_RECORD, PROBE_CACHE_NAME, "statusline-usage.json",
+                         "statusline-usage.lock"):
+                try:
+                    os.remove(os.path.join(cdir, name))
+                except OSError:
+                    pass
+            pyc_dir = os.path.join(cdir, "__pycache__")
+            for name in (os.listdir(pyc_dir) if os.path.isdir(pyc_dir) else []):
+                if name.startswith("statusline"):
+                    try:
+                        os.remove(os.path.join(pyc_dir, name))
+                    except OSError:
+                        pass
+        print(f"statusline: {action}{' (dry run, nothing written)' if dry else ''}; restart Claude Code")
+        return 0
+
+    python = _find_python()
+    if python is None:
+        print("statusline: Python 3.10 or newer was not found as 'python' or 'python3' on PATH; nothing was changed")
+        return 1
+    icons = (_opt(args, "--icons") or "auto").lower()
+    if icons not in ("auto", "nerd", "none", "plain"):
+        print(INSTALL_USAGE, end="")
+        return 2
+    font = _has_nerd_font()
+    if icons == "auto":
+        icons = "nerd" if font else "none"
+    icons = "none" if icons == "plain" else icons
+    command = _launch_command(python, cdir, icons)
+    new_line = dict(settings["statusLine"]) if isinstance(settings.get("statusLine"), dict) else {}
+    new_line.update(type="command", command=command, refreshInterval=1)
+    dest = os.path.join(cdir, "statusline.py")
+    if dry:
+        print(f"statusline: dry run in {cdir}\n  copy {os.path.abspath(__file__)} -> {dest}\n"
+              f"  statusLine.command = {command}\n  refreshInterval = 1, icons = {icons}")
+        return 0
+    os.makedirs(cdir, exist_ok=True)
+    backed_up = backup()
+    try:
+        same = os.path.exists(dest) and os.path.samefile(dest, __file__)
+    except OSError:
+        same = False
+    if not same:
+        shutil.copyfile(__file__, dest)
+    pyc_dir = os.path.join(cdir, "__pycache__")  # a stale compile of an older copy must not be reused
+    for name in (os.listdir(pyc_dir) if os.path.isdir(pyc_dir) else []):
+        if name.startswith("statusline"):
+            try:
+                os.remove(os.path.join(pyc_dir, name))
+            except OSError:
+                pass
+    previous = record.get("previous") if _is_ours(settings.get("statusLine")) else settings.get("statusLine")
+    settings["statusLine"] = new_line
+    _write_json(settings_path, settings)
+    _write_json(record_path, {"previous": previous, "installed": stamp})
+    if "--no-test" not in args:
+        ok, out = _smoke_test(command)
+        if not ok:
+            original = dict(settings)
+            if previous:
+                original["statusLine"] = previous
+            else:
+                original.pop("statusLine", None)
+            _write_json(settings_path, original)
+            print(f"statusline: the status line failed its self-test, so settings.json was put back.\n  {out}")
+            return 1
+        sample = re.sub(r"\x1b\[[0-9;]*m", "", out.splitlines()[0] if out else "")
+        print(f"statusline: self-test ok: {sample}")
+    print(f"statusline: installed to {dest}")
+    if backed_up:
+        print(f"  settings.json backed up in {backed_up}")
+    if icons == "nerd" and not font:
+        print("  note: no Nerd Font found; install one and select it in your terminal, or reinstall with --icons none")
+    elif icons == "none":
+        print("  plain icons: install a Nerd Font (https://www.nerdfonts.com), select it in your terminal, then run"
+              " `install --icons nerd` for the icon set")
+    print("  restart Claude Code to see it")
+    return 0
+
+
 def main():
     args = sys.argv[1:]  # argv[0] is this file, or '-c' when main() is imported and called
+    if args and args[0] in ("install", "uninstall"):
+        return install_main(args)
     if "--refresh" in args:
         # The spawning render created the lock and passed its token; a manual run takes its own.
         token = _opt(args, "--lock-token")
@@ -1775,4 +2015,4 @@ def read_stdin():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
