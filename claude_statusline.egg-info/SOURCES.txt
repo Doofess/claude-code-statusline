@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-statusline.py
-claude_statusline.egg-info/PKG-INFO
-claude_statusline.egg-info/SOURCES.txt
-claude_statusline.egg-info/dependency_links.txt
-claude_statusline.egg-info/entry_points.txt
-claude_statusline.egg-info/top_level.txt
