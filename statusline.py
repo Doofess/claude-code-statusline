@@ -175,18 +175,21 @@ NATIVE_VERSIONS = os.path.join(HOME, ".local", "share", "claude", "versions")
 # (e.g. CaskaydiaMono Nerd Font). Pick with --icons nerd or STATUSLINE_ICONS=nerd.
 # Plain mode also serves the classic Windows console (Consolas), so only glyphs it has.
 # Icons only where they stand in for a label or a word, never next to one.
+# The Nerd icons are Font Awesome and Devicons code points (U+E73C, U+F017..U+F252), which every Nerd Font
+# version has. The Material Design set at U+F0001 and up only exists in Nerd Fonts 3+; an older font draws
+# those as placeholder diamonds.
 PLAIN_ICONS = {"ok": "\u2713", "up": "\u2191", "warn": "\u25b2", "reload": "~"}
 NERD_ICONS = {
-    "five_hour": "\U000F051F",  # md-timer_sand
-    "seven_day": "\U000F0A33",  # md-calendar_week
-    "duration": "\U000F0150",  # md-clock_outline: replaces the word 'session'
-    "venv": "\U000F0320",     # md-language_python
-    "ports": "\U000F0318",    # md-lan_connect
-    "ok": "\U000F05E0",       # md-check_circle
-    "up": "\U000F0CE1",       # md-arrow_up_circle
-    "reload": "\U000F0453",   # md-reload
-    "warn": "\U000F0026",     # md-alert
-    "tag": "\U000F04FC",      # md-tag_outline: replaces the quotes round the session name
+    "five_hour": "",   # fa-hourglass-half
+    "seven_day": "",   # fa-calendar
+    "duration": "",    # fa-clock-o: replaces the word 'session'
+    "venv": "",        # dev-python
+    "ports": "",       # fa-plug
+    "ok": "",          # fa-check-circle
+    "up": "",          # fa-arrow-circle-up
+    "reload": "",      # fa-refresh
+    "warn": "",        # fa-warning
+    "tag": "",         # fa-tag: replaces the quotes round the session name
     "segment": "",  # powerline slants: one tilted full-height bar segment
 }
 ICON = dict(PLAIN_ICONS)

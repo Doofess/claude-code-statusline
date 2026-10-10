@@ -67,7 +67,7 @@ Model and the three percentages always stay, with their `→reset` countdowns: `
 
 ### Icons
 
-Plain mode (the default) uses only glyphs that Consolas, Cascadia, Menlo and DejaVu have: `█` bars, `✓ ↑ ▲ ~ → ›`. `--icons nerd` (or `STATUSLINE_ICONS=nerd`) swaps in [Nerd Font](https://www.nerdfonts.com/) glyphs only where they replace a word: the bars become slanted segments, the health marks, the clock, the session-name tag, venv and ports get glyphs. Labels such as `ctx`, `$` and the model name stay plain text in both modes.
+Plain mode (the default) uses only glyphs that Consolas, Cascadia, Menlo and DejaVu have: `█` bars, `✓ ↑ ▲ ~ → ›`. `--icons nerd` (or `STATUSLINE_ICONS=nerd`) swaps in [Nerd Font](https://www.nerdfonts.com/) glyphs (Font Awesome and Devicons code points, so any Nerd Font version works) only where they replace a word: the bars become slanted segments, the health marks, the clock, the session-name tag, venv and ports get glyphs. Labels such as `ctx`, `$` and the model name stay plain text in both modes.
 
 The classic Windows console host cannot draw Nerd Font glyphs, so `nerd` falls back to plain there. Claude Code spawns the status line without a console of its own, so the script looks up the process chain for the window that hosts the session (a `ConsoleWindowClass` window means conhost, a `PseudoConsoleWindow` means Windows Terminal, VS Code or another ConPTY host); the verdict is cached for an hour. No verdict keeps the icons you asked for. `STATUSLINE_FORCE_ICONS=1` skips the check.
 
