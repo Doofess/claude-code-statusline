@@ -4,10 +4,14 @@
 
 """Unified status line for Claude Code.
 
-Sections (left to right):
-    model · effort │ ctx ↔ N% bar used/size │ 5h ↔ N% bar reset │ 7d ↔ N% bar reset │ $cost │ session time │ project › git │ venv │ :ports
+One line, always (Claude Code draws its own mode line below it), left to right:
+    project › branch ~N “session-name” │ model · effort │ ctx N% bar used/size │
+    5h N% bar reset │ 7d N% bar reset │ $cost │ session time │ health marks │
+    skills │ venv │ :ports
 
-Every section after model + ctx is auto-detected and shown only when relevant.
+It is designed for a 120-column window and fits itself to COLUMNS: wider windows show
+more, narrower ones drop items by priority (see format_statusline). It never wraps.
+Items with nothing to show (no session name, no ports, no venv) are left out.
 Standalone: no external dependencies.
 
 Usage numbers: Claude Code only pipes in the rate limits from *this* session's
@@ -33,14 +37,13 @@ See https://github.com/roeimichael/claude-code-statusline for docs.
 import json
 import os
 import re
-import socket
-import subprocess
 import sys
 import time
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+import zlib
 from pathlib import Path
+
+# subprocess, socket and datetime are imported where they are used: a render with a
+# warm probe cache needs none of them, and it runs every second.
 
 # ANSI colors (256-color palette, so macOS Terminal.app renders them too)
 def fg(n):
@@ -69,7 +72,7 @@ RED = fg(203)
 # Meter colors by percentage: (below this %, color), then RED.
 STAGES = ((50, fg(114)), (70, fg(221)), (85, fg(208)))
 
-SEP = f"  {DIM}│{RST}  "
+SEP = f" {DIM}│{RST} "  # one space each side: room for three bars on one 120-column line
 # Columns kept free at the window's right edge (Claude Code pads the status line).
 EDGE = 4
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
@@ -77,27 +80,6 @@ ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 def visible_width(s):
     return len(ANSI_RE.sub("", s))
-
-
-def flow(items, width):
-    """Join items with SEP into lines no wider than `width`; an item never splits.
-
-    After packing greedily, a last line holding a single item borrows the
-    previous line's last item when that still fits, so it does not sit alone.
-    """
-    lines, cur = [], []
-    for item in items:
-        if cur and visible_width(SEP.join(cur + [item])) > width:
-            lines.append(cur)
-            cur = []
-        cur.append(item)
-    if cur:
-        lines.append(cur)
-    if len(lines) >= 2 and len(lines[-1]) == 1 and len(lines[-2]) >= 3:
-        moved = [lines[-2][-1]] + lines[-1]
-        if visible_width(SEP.join(moved)) <= width:
-            lines[-2], lines[-1] = lines[-2][:-1], moved
-    return [SEP.join(line) for line in lines]
 
 
 def mid_trunc(s, n):
@@ -113,10 +95,11 @@ BAR = "\u2588"          # full block: fills the whole cell height
 BAR_TRACK = fg(238)      # the empty part of a bar
 EFFORT = {"low": DIM, "medium": GREEN, "high": AMBER, "xhigh": fg(209), "max": fg(203)}
 
-# Second line: Claude Code version, plugin reload and MCP server status.
+# Health marks: MCP servers, Claude Code version and plugin reload state.
 SHOW_HEALTH = True
 # Extra line listing running subagents (model, effort, context tokens). Off by default:
-# the agent list under the prompt is the better place, see the companion mod.
+# the agent list under the prompt is the better place, see the companion mod. It is the
+# one way to get a second line.
 SHOW_AGENTS = False
 
 # Edit this list to match the dev ports you care about.
@@ -137,7 +120,8 @@ NATIVE_VERSIONS = Path.home() / ".local" / "share" / "claude" / "versions"
 
 # Icons. "none" uses plain text; "nerd" needs a Nerd Font in the terminal
 # (e.g. CaskaydiaMono Nerd Font). Pick with --icons nerd or STATUSLINE_ICONS=nerd.
-PLAIN_ICONS = {"ok": "\u2713", "up": "\u2191", "warn": "\u25b2", "reload": "\u21bb"}
+# Plain mode also serves the classic Windows console (Consolas), so only glyphs it has.
+PLAIN_ICONS = {"ok": "\u2713", "up": "\u2191", "warn": "\u25b2", "reload": "~"}
 NERD_ICONS = {
     "model": "\U000F167A",    # md-robot_outline
     "ctx": "\U000F0830",      # md-poker_chip (tokens)
@@ -149,7 +133,7 @@ NERD_ICONS = {
     "branch": "\ue725",       # dev-git_branch
     "venv": "\U000F0320",     # md-language_python
     "ports": "\U000F0318",    # md-lan_connect
-    "cc": "\U000F07B7",       # md-console_line
+    "cc": "",           # cod-claude: the Claude logo
     "plugins": "\U000F0431",  # md-puzzle
     "skills": "\U000F140B",   # md-lightning_bolt
     "mcp": "\U000F048D",      # md-server_network
@@ -158,9 +142,51 @@ NERD_ICONS = {
     "up": "\U000F0CE1",       # md-arrow_up_circle
     "reload": "\U000F0453",   # md-reload
     "warn": "\U000F0026",     # md-alert
+    "tag": "\U000F04FC",      # md-tag_outline: the session name
     "segment": "",  # powerline slants: one tilted full-height bar segment
 }
 ICON = dict(PLAIN_ICONS)
+
+
+def console_window_class():
+    """Window class of this process's console on Windows ('' when it has none), else None.
+
+    The classic console host is 'ConsoleWindowClass'; Windows Terminal's ConPTY is
+    'PseudoConsoleWindow'.
+    """
+    if os.name != "nt":
+        return None
+    if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
+        return None  # a terminal that says what it is: no need to pay for ctypes (~10 ms)
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if not hwnd:
+            return ""
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value
+    except Exception:
+        return None
+
+
+def effective_icons(mode):
+    """The requested icon set, unless this terminal cannot draw it.
+
+    The classic Windows console shows Nerd Font glyphs as boxes (and miscounts their
+    width), so 'nerd' falls back to 'none' there. A console without a window counts
+    too, unless Windows Terminal (WT_SESSION) or another terminal (TERM_PROGRAM) set
+    its mark. STATUSLINE_FORCE_ICONS=1 skips the check. With WT_SESSION or TERM_PROGRAM
+    set, console_window_class() does not even ask Windows (the answer is 'keep nerd').
+    """
+    if mode != "nerd" or os.environ.get("STATUSLINE_FORCE_ICONS"):
+        return mode
+    cls = console_window_class()
+    if cls == "ConsoleWindowClass":
+        return "none"
+    if cls == "" and not os.environ.get("WT_SESSION") and not os.environ.get("TERM_PROGRAM"):
+        return "none"
+    return mode
 
 
 def set_icons(mode):
@@ -182,10 +208,10 @@ def color_pct(p):
     return RED
 
 
-def bar(p, width=8):
+def bar(p, width=5, segments=3):
+    """A bar of `width` full blocks, or `segments` slanted segments with Nerd icons."""
     if ICON.get("segment"):
-        # Nerd Font: five slanted full-height segments.
-        seg, width = ICON["segment"], 5
+        seg, width = ICON["segment"], segments
     else:
         seg = BAR
     # Any usage lights the first segment, so a low reading never looks empty.
@@ -193,17 +219,20 @@ def bar(p, width=8):
     return f"{color_pct(p)}{seg * filled}{RST}{BAR_TRACK}{seg * (width - filled)}{RST}"
 
 
-def meter(label, p, suffix="", icon=None, pct_first=False):
-    """'label ▰▰▱▱ N% suffix' ('label N% ▰▰▱▱ suffix' with pct_first), or 'label --' when unknown."""
-    head = ic(icon, color_pct(p) if p is not None else DIM) if icon else ""
+def meter(label, p, icon, with_bar=True, suffix=""):
+    """'ctx 43% ▰▰▱ 430k/1M': label and value in the stage color, then bar and a light-grey suffix.
+
+    'ctx --' (no bar, no suffix) when the reading is unknown.
+    """
     if p is None:
-        return f"{head}{DIM}{label} --{RST}"
-    tail = f" {DIM}{suffix}{RST}" if suffix else ""
-    pct = f"{color_pct(p)}{p:.0f}%{RST}"
-    if pct_first:
-        # Usage windows: the label shares the percentage's color, joined by an arrow.
-        return f"{head}{color_pct(p)}{label}{RST} {DIM}↔{RST} {pct} {bar(p)}{tail}"
-    return f"{head}{DIM}{label}{RST} {bar(p)} {pct}{tail}"
+        return f"{ic(icon)}{DIM}{label} --{RST}"
+    c = color_pct(p)
+    out = f"{ic(icon, c)}{c}{label}{RST} {c}{p:.0f}%{RST}"
+    if with_bar:
+        out += f" {bar(p)}"
+    if suffix:
+        out += f" {DIM}{suffix}{RST}"
+    return out
 
 
 def fmt_duration(ms):
@@ -245,12 +274,22 @@ def fmt_tokens(n):
 def context_tokens(cw):
     """'used/size' tokens in the context window, or '' when the size is unknown."""
     size = cw.get("context_window_size")
-    if not size:
+    u = cw.get("current_usage")
+    if not size or not isinstance(u, dict):
         return ""
-    u = cw.get("current_usage") or {}
-    used = sum(int(u.get(k) or 0) for k in
-               ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    if all(u.get(k) is None for k in keys):
+        return ""  # no reply yet: unknown, not "0 tokens"
+    used = sum(int(u.get(k) or 0) for k in keys)
     return f"{fmt_tokens(used)}/{fmt_tokens(int(size))}"
+
+
+def context_pct(cw):
+    """Context window usage in percent, or None when Claude Code has not said."""
+    try:
+        return float(cw.get("used_percentage"))
+    except (TypeError, ValueError):
+        return None
 
 
 def fmt_cost(c):
@@ -261,11 +300,193 @@ def fmt_cost(c):
 
 
 def run(cmd, timeout=1.0):
+    import subprocess
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout if r.returncode == 0 else ""
     except Exception:
         return ""
+
+
+# --- probe cache -------------------------------------------------------------
+# With a 1-second refreshInterval every render must be cheap, so the slow probes
+# (git, port scan, health) keep their results for a few seconds in one JSON file
+# shared by all sessions. Only probe results go in, never the stdin payload's live
+# numbers (percentages, cost, session time), so those are always current.
+
+PROBE_CACHE_NAME = "statusline-probe-cache.json"
+GIT_TTL = 3        # git status, per directory
+PORTS_TTL = 10     # dev port scan
+HEALTH_TTL = 10    # version status, plugins to reload, MCP status, per session and project
+SKILLS_TTL = 60    # skill count (a folder scan), per project
+NAME_REFRESH = 30  # the session name is keyed by transcript size, not a TTL; it is re-stored this often so it never expires
+
+
+class ProbeCache:
+    """{key: {"at": epoch, "v": value}} loaded once per render and saved at the end.
+
+    Values come back as JSON, so tuples come back as lists. A missing, corrupt or
+    unwritable file only means the probes run again; it never breaks rendering.
+    """
+
+    SKEW = 2      # seconds another session's clock reading may be ahead of ours
+    CLAIM_TTL = 5  # seconds before a claim left by a dead session is ignored
+
+    def __init__(self, path, now):
+        self.path, self.now, self.dirty = path, now, False
+        self.touched = set()  # keys this render computed: the only ones it writes back
+        self.entries = self._read()
+
+    def _read(self):
+        if self.path is None:
+            return {}
+        try:
+            entries = json.loads(Path(self.path).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return entries if isinstance(entries, dict) else {}
+
+    @staticmethod
+    def _at(e):
+        """The entry's timestamp, or None when it is not a well-formed entry."""
+        if isinstance(e, dict) and "v" in e and _number(e.get("at")):
+            return e["at"]
+        return None
+
+    def _claim_path(self, key):
+        return Path(f"{self.path}.{zlib.crc32(key.encode('utf-8')):08x}.claim")
+
+    def _claim(self, key):
+        """True when this session may recompute key now; False when another one already is."""
+        claim = self._claim_path(key)
+        for _ in range(2):
+            try:
+                os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                return True
+            except FileExistsError:
+                try:
+                    if time.time() - claim.stat().st_mtime < self.CLAIM_TTL:
+                        return False
+                    claim.unlink()  # a session died mid-probe
+                except OSError:
+                    return False
+            except OSError:
+                return True  # cannot coordinate: just probe
+        return False
+
+    def _release(self, key):
+        try:
+            self._claim_path(key).unlink()
+        except OSError:
+            pass
+
+    def get(self, key, ttl, compute):
+        """The cached value for key while younger than ttl seconds, else compute() (and keep it).
+
+        When the entry has expired and another session is already recomputing it, the
+        stale value is returned instead, so concurrent sessions do not all probe at once.
+        """
+        e = self.entries.get(key)
+        at = self._at(e)
+        stale = at is not None
+        if stale and -self.SKEW <= self.now - at < ttl:
+            return e["v"]
+        claimed = False
+        if stale and self.path is not None:
+            if not self._claim(key):
+                return e["v"]
+            claimed = True
+        try:
+            value = compute()
+        finally:
+            if claimed:
+                self._release(key)
+        self.entries[key] = {"at": self.now, "v": value}
+        self.touched.add(key)
+        self.dirty = True
+        return value
+
+    def peek(self, key):
+        """A copy of the dict stored under key (even an expired one), or {}."""
+        e = self.entries.get(key)
+        return dict(e["v"]) if self._at(e) is not None and isinstance(e["v"], dict) else {}
+
+    def age(self, key):
+        """Seconds since key was stored, or None when it is missing or malformed."""
+        at = self._at(self.entries.get(key))
+        return None if at is None else self.now - at
+
+    def put(self, key, value):
+        """Store value under key now, without any TTL check."""
+        self.entries[key] = {"at": self.now, "v": value}
+        self.touched.add(key)
+        self.dirty = True
+
+    def save(self):
+        """Merge with what is on disk now, then write atomically (tmp file + os.replace).
+
+        Other sessions save to the same file, so this render's computed entries are laid
+        over a fresh read (the newest `at` per key wins) instead of over the copy loaded
+        at the start. Entries no TTL can still use are dropped.
+        """
+        if self.path is None or not self.dirty:
+            return
+        keep = max(GIT_TTL, PORTS_TTL, HEALTH_TTL, SKILLS_TTL)
+        tmp = Path(f"{self.path}.{os.getpid()}.tmp")
+        lock = Path(f"{self.path}.lock")
+        locked = self._lock(lock)  # without it (timeout, odd folder) the merge is just best effort
+        try:
+            merged = {k: e for k, e in self._read().items() if self._at(e) is not None}
+            for key in self.touched:
+                mine, theirs = self.entries[key], merged.get(key)
+                if theirs is None or theirs["at"] <= mine["at"]:
+                    merged[key] = mine
+            entries = {k: e for k, e in merged.items() if -self.SKEW <= self.now - e["at"] < keep}
+            tmp.write_text(json.dumps(entries), encoding="utf-8")
+            for attempt in range(3):
+                try:
+                    os.replace(tmp, self.path)
+                    break
+                except PermissionError:  # a reader has the file open (Windows)
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.005)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        finally:
+            if locked:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+
+    def _lock(self, lock):
+        """Hold the save lock (a file made with O_EXCL), waiting up to ~50 ms; False if not got."""
+        deadline = time.monotonic() + 0.05
+        while True:
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                return True
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime > 2:
+                        lock.unlink()  # left by a killed session
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.002)
+            except OSError:
+                return False
+
+
+def _probe_cache(cache):
+    """The render's ProbeCache, or a throwaway one (always probes) when none is given."""
+    return cache if cache is not None else ProbeCache(None, time.time())
 
 
 # --- usage -----------------------------------------------------------------
@@ -276,6 +497,7 @@ def _epoch(v):
         return None
     if isinstance(v, (int, float)):
         return float(v)
+    from datetime import datetime
     try:
         return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
     except ValueError:
@@ -339,15 +561,46 @@ def read_oauth_token():
     return oauth.get("accessToken")
 
 
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+
+
+def _clean_usage_cache(raw):
+    """Only the well-shaped parts of a parsed usage cache; anything else is dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {k: raw[k] for k in ("fetched_at", "usage_at", "tags_at") if _number(raw.get(k))}
+    if isinstance(raw.get("error"), str):
+        out["error"] = raw["error"]
+    tags = raw.get("tags")
+    if isinstance(tags, dict):
+        out["tags"] = {k: v for k, v in tags.items() if isinstance(k, str) and isinstance(v, str)}
+    usage = raw.get("usage")
+    if isinstance(usage, dict):
+        clean = {}
+        for key in WINDOWS:
+            w = usage.get(key)
+            if not isinstance(w, dict) or not _number(w.get("utilization")):
+                continue
+            resets = w.get("resets_at")
+            if resets is not None and not (_number(resets) or (isinstance(resets, str) and _epoch(resets) is not None)):
+                continue
+            clean[key] = {"utilization": w["utilization"], "resets_at": resets}
+        out["usage"] = clean
+    return out
+
+
 def load_usage_cache():
+    """The usage cache as a dict of well-shaped values; {} when missing, corrupt or the wrong type."""
     try:
-        return json.loads(USAGE_CACHE.read_text(encoding="utf-8"))
+        return _clean_usage_cache(json.loads(USAGE_CACHE.read_text(encoding="utf-8")))
     except Exception:
         return {}
 
 
 def refresh_cache():
     """Fetch whatever is stale into the cache. Runs in a detached child process."""
+    import urllib.request  # here, not at the top: ~30ms the render itself never needs
     cache = load_usage_cache()
     now = time.time()
     if now - (cache.get("fetched_at") or 0) >= USAGE_TTL:
@@ -365,6 +618,7 @@ def refresh_cache():
 
 
 def _fetch_usage(cache, now):
+    import urllib.request
     cache["fetched_at"] = now
     try:
         token = read_oauth_token()
@@ -384,10 +638,15 @@ def _fetch_usage(cache, now):
         cache["error"] = f"{type(e).__name__}: {e}"[:200]
 
 
-def _take_lock(now):
+def _take_lock(now, token=""):
+    """Create the usage lock holding `token` (who owns it); False when a fresh one exists."""
     for _ in range(2):
         try:
-            os.close(os.open(USAGE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            fd = os.open(USAGE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, token.encode("utf-8"))
+            finally:
+                os.close(fd)
             return True
         except FileExistsError:
             try:
@@ -401,12 +660,39 @@ def _take_lock(now):
     return False
 
 
+def _release_lock(token):
+    """Remove the usage lock, but only if it still holds our token (it may be someone else's by now)."""
+    try:
+        if token and USAGE_LOCK.read_text(encoding="utf-8") == token:
+            USAGE_LOCK.unlink()
+    except OSError:
+        pass
+
+
+REFRESH_DEADLINE = 15  # seconds the detached refresh may live, however slow the network is
+
+
+def _expire(token):
+    """The deadline passed: give up the lock (if ours) and leave at once."""
+    _release_lock(token)
+    os._exit(1)
+
+
+def _arm_deadline(token):
+    import threading
+    timer = threading.Timer(REFRESH_DEADLINE, _expire, (token,))
+    timer.daemon = True
+    timer.start()
+
+
 def maybe_refresh(cache, now):
     """Start a background fetch when anything in the cache is stale. Never blocks."""
     stale = (now - (cache.get("fetched_at") or 0) >= USAGE_TTL
              or now - (cache.get("tags_at") or 0) >= RELEASE_TTL)
-    if not stale or not _take_lock(now):
+    token = f"{os.getpid()}-{time.time_ns()}"
+    if not stale or not _take_lock(now, token):
         return
+    import subprocess
     kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
           "stderr": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
@@ -414,9 +700,9 @@ def maybe_refresh(cache, now):
     else:
         kw["start_new_session"] = True
     try:
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--refresh"], **kw)
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--refresh", "--lock-token", token], **kw)
     except Exception:
-        USAGE_LOCK.unlink(missing_ok=True)
+        _release_lock(token)
 
 
 # --- health: version, plugins, MCP ------------------------------------------
@@ -466,11 +752,29 @@ def plugins_needing_reload(installed, enabled, loaded_at):
     return sorted(out)
 
 
-def plugins_loaded_at(transcript_path):
-    """When this session last loaded plugins: its first entry, or the last /reload-plugins."""
+def plugins_loaded_at(transcript_path, state=None):
+    """When this session last loaded plugins: its first entry, or the last /reload-plugins.
+
+    state: a dict the caller keeps between calls (it is updated in place). With it, a
+    transcript that only grew since the last call is scanned from the end of the last
+    scan, not from the start; a shorter file or another path is scanned in full.
+    """
+    state = {} if state is None else state
+    path = str(transcript_path)
     try:
-        raw = Path(transcript_path).read_bytes()
-    except (OSError, TypeError):
+        size = os.stat(transcript_path).st_size
+    except (OSError, TypeError, ValueError):
+        return None
+    start = reload_t = 0
+    first_t = None
+    if (state.get("path") == path and isinstance(state.get("size"), int) and 0 <= state["size"] <= size
+            and _number(state.get("first"))):
+        start, first_t, reload_t = state["size"], state["first"], state.get("reload")
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(start)
+            raw = f.read()
+    except OSError:
         return None
 
     def ts_of(line):
@@ -481,12 +785,16 @@ def plugins_loaded_at(transcript_path):
 
     i = raw.rfind(b"<command-name>/reload-plugins</command-name>")
     if i >= 0:
-        start = raw.rfind(b"\n", 0, i) + 1
+        s = raw.rfind(b"\n", 0, i) + 1
         end = raw.find(b"\n", i)
-        t = ts_of(raw[start:end if end >= 0 else None])
+        t = ts_of(raw[s:end if end >= 0 else None])
         if t:
-            return t
-    return _first_timestamp(raw)
+            reload_t = t
+    if first_t is None:
+        first_t = _first_timestamp(raw)
+    # Resume at a line boundary, so a line still being written is read again, whole.
+    state.update(path=path, size=start + raw.rfind(b"\n") + 1, first=first_t, reload=reload_t or None)
+    return reload_t or first_t
 
 
 def _first_timestamp(raw):
@@ -617,53 +925,88 @@ def count_skills(installed, enabled, claude_dir, project_dir=None):
     return n
 
 
-def format_health(running, version, reload_plugins, mcp, skills=None):
-    """Health items: Claude Code version, plugin reload, skills, MCP servers. '' when nothing is known."""
-    parts = []
-    if running:
-        state, newer = version
-        cc = f"{ic('cc')}{DIM}Claude Code{RST} {running}"
-        if state == "ok":
-            parts.append(f"{cc} {GREEN}{ICON['ok']}{RST}")
-        elif state == "restart":  # newer build already downloaded; this window still runs the old one
-            parts.append(f"{cc} {AMBER}{ICON['up']} restart for {newer}{RST}")
-        elif state == "update":
-            parts.append(f"{cc} {AMBER}{ICON['up']} {newer} available{RST}")
-        else:
-            parts.append(cc)
-    if reload_plugins is not None:
-        label = f"{ic('plugins')}{DIM}plugins{RST}"
-        if reload_plugins:
-            parts.append(f"{label} {AMBER}{ICON['reload']} {len(reload_plugins)} updated{RST}"
-                         f" {DIM}·{RST} run {AMBER}/reload-plugins{RST}")
-        else:
-            parts.append(f"{label} {GREEN}{ICON['ok']}{RST}")
-    if skills:
-        parts.append(f"{ic('skills')}{DIM}skills{RST} {skills}")
+def health_marks(running, version, reload_plugins, mcp):
+    """Health marks as [(text, level)] in line order: MCP servers, Claude Code, plugins.
+
+    Level 0 is healthy (a green check), 1 needs attention (amber), 2 is a failure (red).
+    A mark that needs attention says so by name: '▲ Gmail failed', '↑ 2.2 available',
+    '~ reload'. Marks without data (no logs, no version, no plugin list) are left out.
+    """
+    marks = []
     if mcp is not None:
         ok, failed = mcp
-        if ok or failed:
-            bits = [f"{len(ok)} connected"] if ok else []
-            if failed:
-                more = f" +{len(failed) - 1}" if len(failed) > 1 else ""
-                bits.append(f"{RED}{ICON['warn']} {failed[0]}{more} failed{RST}")
-            parts.append(f"{ic('mcp')}{DIM}mcp{RST} " + f" {DIM}·{RST} ".join(bits))
-    return SEP.join(parts)
+        if failed:
+            more = f" +{len(failed) - 1}" if len(failed) > 1 else ""
+            marks.append((f"{RED}{ICON['warn']} {mid_trunc(failed[0], 12)}{more} failed{RST}", 2))
+        elif ok:
+            marks.append((f"{ic('mcp')}{DIM}mcp{RST} {len(ok)} {GREEN}{ICON['ok']}{RST}", 0))
+    if running:
+        state, newer = version
+        cc = f"{ic('cc', MODEL)}{DIM}CC{RST} {running}"  # logo in Claude orange
+        if state == "ok":
+            marks.append((f"{cc} {GREEN}{ICON['ok']}{RST}", 0))
+        elif state == "restart":  # newer build already downloaded; this window still runs the old one
+            marks.append((f"{AMBER}{ICON['up']} restart{f' for {newer}' if newer else ''}{RST}", 1))
+        elif state == "update":
+            marks.append((f"{AMBER}{ICON['up']} {f'{newer} available' if newer else 'update'}{RST}", 1))
+        else:
+            marks.append((cc, 0))
+    if reload_plugins is not None:
+        if reload_plugins:
+            marks.append((f"{AMBER}{ICON['reload']} reload{RST}", 1))
+        else:
+            marks.append((f"{ic('plugins')}{DIM}plugins{RST} {GREEN}{ICON['ok']}{RST}", 0))
+    return marks
 
 
-def health_line(data):
-    settings = _read_json(CLAUDE_DIR / "settings.json")
+def health_state(data, cache=None):
+    """(running, version, reload_plugins, mcp, skills) for health_marks and the skills item.
+
+    cache: the render's ProbeCache; the probes are kept HEALTH_TTL seconds per session
+    and project (SKILLS_TTL for the skill count, per project).
+    """
+    cache = _probe_cache(cache)
+    running = data.get("version")
+    ws = data.get("workspace") or {}
+    key = json.dumps([data.get("session_id"), ws.get("project_dir") or data.get("cwd"),
+                      data.get("transcript_path"), running])
+    version, reload_plugins, mcp = cache.get("health:" + key, HEALTH_TTL, lambda: _health_probe(data, cache))
+
+    def skill_count():
+        settings, installed = _settings_and_plugins()
+        return count_skills(installed, _enabled(settings), CLAUDE_DIR, ws.get("project_dir"))
+    skills = cache.get("skills:" + json.dumps(ws.get("project_dir")), SKILLS_TTL, skill_count)
+    return running, version, reload_plugins, mcp, skills
+
+
+def _settings_and_plugins():
+    return (_read_json(CLAUDE_DIR / "settings.json"),
+            _read_json(CLAUDE_DIR / "plugins" / "installed_plugins.json"))
+
+
+def _enabled(settings):
+    return {k for k, v in (settings.get("enabledPlugins") or {}).items() if v}
+
+
+def _health_probe(data, cache=None):
+    """[version, reload_plugins, mcp]: the slow part of health_state (it reads the transcript and MCP logs).
+
+    cache: the render's ProbeCache, which also keeps how far the transcript was scanned.
+    """
+    cache = _probe_cache(cache)
+    settings, installed = _settings_and_plugins()
     running = data.get("version")
     channel = settings.get("autoUpdatesChannel") or "latest"
     published = (load_usage_cache().get("tags") or {}).get(channel)
     version = version_status(running, installed_versions(), published) if running else ("unknown", None)
 
     reload_plugins = None
-    loaded_at = plugins_loaded_at(data.get("transcript_path"))
-    installed = _read_json(CLAUDE_DIR / "plugins" / "installed_plugins.json")
+    scan_key = "loaded:" + str(data.get("transcript_path"))
+    scan = cache.peek(scan_key)
+    loaded_at = plugins_loaded_at(data.get("transcript_path"), scan)
+    cache.put(scan_key, scan)
     if loaded_at and installed:
-        enabled = {k for k, v in (settings.get("enabledPlugins") or {}).items() if v}
-        reload_plugins = plugins_needing_reload(installed, enabled, loaded_at)
+        reload_plugins = plugins_needing_reload(installed, _enabled(settings), loaded_at)
 
     ws = data.get("workspace") or {}
     started = session_started_at(data.get("transcript_path"))
@@ -671,9 +1014,7 @@ def health_line(data):
                          since=started - 60 if started else None)
     known = {k.split("@")[0] for k in (installed.get("plugins") or {})}
     mcp = mcp_status(logs, data.get("session_id"), known) if logs else None
-    enabled = {k for k, v in (settings.get("enabledPlugins") or {}).items() if v}
-    skills = count_skills(installed, enabled, CLAUDE_DIR, ws.get("project_dir"))
-    return format_health(running, version, reload_plugins, mcp, skills)
+    return [version, reload_plugins, mcp]
 
 
 # --- subagents -----------------------------------------------------------------
@@ -778,9 +1119,29 @@ def format_agents(agents):
 
 # --- workspace probes --------------------------------------------------------
 
-def git_info(cwd):
+def git_info(cwd, cache=None):
+    """(branch, flags) for where_item; None outside a repo, '' without a directory.
+
+    cache: the render's ProbeCache; git status is kept GIT_TTL seconds per directory.
+    """
     if not cwd or not Path(cwd).exists():
         return ""
+    status = _probe_cache(cache).get("git:" + str(cwd), GIT_TTL, lambda: git_status(cwd))
+    if not status:
+        return None
+    branch, stg, mod, unt = status
+    flags = []
+    if stg:
+        flags.append(f"{GREEN}+{stg}{RST}")
+    if mod:
+        flags.append(f"{AMBER}~{mod}{RST}")
+    if unt:
+        flags.append(f"{DIM}?{unt}{RST}")
+    return branch, flags
+
+
+def git_status(cwd):
+    """[branch, staged, modified, untracked] from one git call, or None outside a repo."""
     # One git call instead of five: branch plus staged/modified/untracked counts.
     out = run(["git", "-C", cwd, "status", "--porcelain=v2", "--branch", "--untracked-files=all"])
     branch = oid = ""
@@ -801,36 +1162,30 @@ def git_info(cwd):
         branch = oid
     if not branch:
         return None
-    flags = []
-    if stg:
-        flags.append(f"{GREEN}+{stg}{RST}")
-    if mod:
-        flags.append(f"{AMBER}~{mod}{RST}")
-    if unt:
-        flags.append(f"{DIM}?{unt}{RST}")
-    return branch, flags
+    return [branch, stg, mod, unt]
 
 
-MIN_NAME = 8  # a shortened project or branch name keeps at least this many characters
+MIN_NAME = 14      # a shortened project or branch name keeps at least this many characters
+SHORT_BRANCH = 11  # a tight line shows 'live-usage…': this many characters, then the ellipsis
 
 
-def where_item(proj, git, width=None):
-    """'project › branch flags'. When wider than `width`, the longer of project and
-    branch loses characters from its middle ('claude-co…statusline') until it fits."""
-    branch, flags = git or ("", [])
+def _where_text(proj, branch, flags):
+    parts = []
+    if proj:
+        parts.append(f"{ic('project', PROJECT)}{PROJECT}{proj}{RST}")
+    if branch:
+        color = AMBER if flags else GREEN
+        parts.append(" ".join([f"{ic('branch', color)}{color}{branch}{RST}"] + list(flags)))
+    return f" {DIM}›{RST} ".join(parts)
 
-    def render(p, b):
-        where = []
-        if p:
-            where.append(f"{ic('project', PROJECT)}{PROJECT}{p}{RST}")
-        if b:
-            color = AMBER if flags else GREEN
-            where.append(" ".join([f"{ic('branch', color)}{color}{b}{RST}"] + flags))
-        return f"  {DIM}›{RST}  ".join(where)
 
+def shrink_where(proj, branch, flags, width):
+    """(project, branch) with the longer one losing characters from its middle
+    ('claude-co…statusline') until 'project › branch flags' fits `width`. Neither
+    goes below MIN_NAME characters. width None: unchanged."""
     p_len, b_len = len(proj), len(branch)
-    item = render(proj, branch)
-    while width and visible_width(item) > width:
+    p, b = proj, branch
+    while width and visible_width(_where_text(p, b, flags)) > width:
         if b_len >= p_len and b_len > MIN_NAME:
             b_len -= 1
         elif p_len > MIN_NAME:
@@ -838,9 +1193,107 @@ def where_item(proj, git, width=None):
         elif b_len > MIN_NAME:
             b_len -= 1
         else:
-            break  # as short as it gets; it takes a line of its own
-        item = render(mid_trunc(proj, p_len), mid_trunc(branch, b_len))
-    return item
+            break  # as short as it gets
+        p, b = mid_trunc(proj, p_len), mid_trunc(branch, b_len)
+    return p, b
+
+
+def where_item(proj, git, width=None):
+    """'project › branch flags', shrunk to `width` by shrink_where. git: git_info()'s result."""
+    branch, flags = git or ("", [])
+    return _where_text(*shrink_where(proj, branch, flags, width), flags)
+
+
+def short_branch(branch):
+    """'live-usage-and-redesign' -> 'live-usage…'; short names stay."""
+    return branch if len(branch) <= SHORT_BRANCH + 1 else branch[:SHORT_BRANCH] + "…"
+
+
+# --- session name --------------------------------------------------------------
+
+NAME_MAX = 28           # longest name shown (a hyphenated slug)
+TAIL_BYTES = 262_144    # how much of the transcript's end is searched for a title
+TITLE_KEYS = (("ai-title", "aiTitle"), ("agent-name", "agentName"), ("custom-title", "customTitle"))
+
+
+def slugify(text, cap=NAME_MAX):
+    """'Statusline.py: usage accuracy' -> 'statusline-py-usage-accuracy', cut at a word boundary
+    within `cap` characters (a single longer word is cut hard)."""
+    slug = re.sub(r"[\W_]+", "-", str(text).lower()).strip("-")
+    if len(slug) <= cap:
+        return slug
+    if slug[cap] == "-":
+        return slug[:cap]
+    head = slug[:cap]
+    cut = head.rfind("-")
+    return head[:cut] if cut > 0 else head
+
+
+def tail_title(path, max_bytes=TAIL_BYTES):
+    """The newest session title in the last `max_bytes` of a transcript, '' when there is none.
+
+    A title is an {"type": "ai-title", "aiTitle": ...} entry (or agent-name / custom-title).
+    Transcripts can be 100 MB, so only the end is read; the first, maybe cut, line and a
+    half-written last line are skipped because they do not parse.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        raw = f.read(max_bytes)
+    lines = raw.split(b"\n")
+    if size > max_bytes:
+        lines = lines[1:]
+    markers = [f'"{kind}"'.encode() for kind, _ in TITLE_KEYS]
+    for line in reversed(lines):
+        if not any(m in line for m in markers):
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        for kind, key in TITLE_KEYS:
+            title = entry.get(key) if entry.get("type") == kind else None
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+    return ""
+
+
+def session_name(data, cache=None):
+    """The session's name as a short slug, or '' when it has none.
+
+    The payload's session_name (set with /rename) wins; otherwise the newest title in the
+    transcript's tail. The transcript is only searched again when its size changed: the
+    result is kept in the probe cache under (path, size), and a grown transcript with no
+    title in its tail keeps the name found before.
+    """
+    given = data.get("session_name")
+    if isinstance(given, str) and given.strip():
+        return slugify(given)
+    path = data.get("transcript_path")
+    if not path:
+        return ""
+    try:
+        size = os.stat(path).st_size
+    except (OSError, ValueError, TypeError):
+        return ""
+    cache = _probe_cache(cache)
+    key = "name:" + str(path)
+    saved = cache.peek(key)
+    old = saved.get("name") if isinstance(saved.get("name"), str) else ""
+    if saved.get("size") == size and "name" in saved:
+        if (cache.age(key) or 0) > NAME_REFRESH:
+            cache.put(key, saved)  # keep the entry from expiring while the transcript sits still
+        return old
+    try:
+        title = tail_title(path)
+    except OSError:
+        title = ""
+    name = slugify(title) if title else old
+    cache.put(key, {"size": size, "name": name})
+    return name
 
 
 def line_width():
@@ -862,96 +1315,243 @@ def venv_tag():
     return ""
 
 
-def port_up(port, timeout=0.05):
-    s = socket.socket()
-    s.settimeout(timeout)
+def open_ports(ports=None, timeout=0.02):
+    """Ports on 127.0.0.1 that accept a connection within `timeout` seconds.
+
+    All at once, with non-blocking connects and select(): on Windows a closed port
+    never refuses quickly, so each one waits out the whole timeout. No threads.
+    """
+    import select
+    import socket
+    ports = COMMON_PORTS if ports is None else ports
+    pending, up, socks = {}, set(), []
     try:
-        s.connect(("127.0.0.1", port))
-        s.close()
-        return True
-    except Exception:
-        try:
+        for port in ports:
+            s = socket.socket()
+            pending[s] = port
+            s.setblocking(False)
+            err = s.connect_ex(("127.0.0.1", port))
+            if err == 0:
+                up.add(port)
+            elif err in (10035, 115, 36, 11, 35):  # WSAEWOULDBLOCK, EINPROGRESS, EAGAIN (Linux, macOS)
+                socks.append(s)  # still connecting; anything else was refused at once
+        deadline = time.monotonic() + timeout
+        while socks:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            _, writable, failed = select.select([], socks, socks, left)
+            if not writable and not failed:
+                break
+            for s in set(writable) | set(failed):
+                if s not in failed and s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    up.add(pending[s])
+                socks.remove(s)
+    except OSError:
+        pass
+    finally:
+        for s in pending:
             s.close()
-        except Exception:
-            pass
-        return False
+    return [p for p in ports if p in up]
 
 
-def ports_tag():
-    # In parallel: on Windows every closed port waits out the full timeout.
-    with ThreadPoolExecutor(max_workers=len(COMMON_PORTS) or 1) as pool:
-        up = [p for p, ok in zip(COMMON_PORTS, pool.map(port_up, COMMON_PORTS)) if ok]
+def ports_tag(cache=None):
+    """':3000,5173' for the dev ports that answer. cache: kept PORTS_TTL seconds."""
+    up = _probe_cache(cache).get("ports:" + ",".join(map(str, COMMON_PORTS)), PORTS_TTL, open_ports)
     return f"{ic('ports', GREEN)}{GREEN}:{','.join(str(p) for p in up)}{RST}" if up else ""
 
 
 # --- layout ------------------------------------------------------------------
 
-def format_statusline(data, usage=None, now=None, show_usage=True, workspace=True):
-    """usage: merge_usage() result, or None when nothing is known yet.
-
-    workspace=False leaves project, git, venv and ports to workspace_line().
-    """
-    now = time.time() if now is None else now
-    cw = data.get("context_window", {}) or {}
-    cost = data.get("cost", {}) or {}
+def model_head(data):
+    """'Opus 5.5 · high' in the model family's color and the effort's color."""
     model = data.get("model", {}) or {}
-
     name = model.get("display_name", "Claude")
     mc = model_color(model.get("id") or name)
     head = f"{ic('model', mc)}{mc}{name}{RST}"
     level = (data.get("effort") or {}).get("level")
     if level:
         head += f" {DIM}·{RST} {EFFORT.get(level, '')}{level}{RST}"
-    parts = [head]
-    parts.append(meter("ctx", float(cw.get("used_percentage", 0) or 0), context_tokens(cw), "ctx",
-                       pct_first=True))
+    return head
 
+
+def session_time(data):
+    """Session time: clock icon and number, or 'session 12m' without icons; '' before any time."""
+    dur = fmt_duration(int((data.get("cost", {}) or {}).get("total_duration_ms", 0) or 0))
+    if not dur:
+        return ""
+    return f"{ic('duration')}{DIM}{dur}{RST}" if ICON.get("duration") else f"{DIM}session {dur}{RST}"
+
+
+def name_tag(name):
+    """The session name as a tag: quoted in plain mode, after a tag icon with Nerd icons."""
+    if ICON.get("tag"):
+        return f"{ic('tag', CYAN)}{CYAN}{name}{RST}"
+    return f"{CYAN}“{name}”{RST}"
+
+
+def gather_extras(data, cache=None):
+    """The probed items for format_statusline: project, git, session name, health, ports, venv.
+
+    Everything behind the probe cache (git 3 s, ports 10 s, health 10 s, skills 60 s, the
+    name until the transcript grows). A probe that fails only leaves its item out.
+    """
+    ws = data.get("workspace", {}) or {}
+    cwd = ws.get("current_dir") or ws.get("project_dir") or data.get("cwd") or os.getcwd()
+    extras = {"proj": Path(cwd).name if cwd else "", "git": None, "name": "", "marks": [],
+              "skills": None, "ports": "", "venv": ""}
+    for key, probe in (("git", lambda: git_info(cwd, cache)),
+                       ("name", lambda: session_name(data, cache)),
+                       ("venv", venv_tag),
+                       ("ports", lambda: ports_tag(cache))):
+        try:
+            extras[key] = probe()
+        except Exception:
+            pass
+    if SHOW_HEALTH:
+        try:
+            running, version, reload_plugins, mcp, skills = health_state(data, cache)
+            extras["marks"] = health_marks(running, version, reload_plugins, mcp)
+            extras["skills"] = skills
+        except Exception:
+            pass
+    return extras
+
+
+def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, width=None):
+    """The status line: ONE line, never wider than `width` columns (None: no limit).
+
+    usage: merge_usage() result, or None when nothing is known yet. extras: gather_extras()'s
+    result; without it only the session's own items show. Left to right:
+
+        project › branch ~N “session-name” │ model · effort │ ctx % bar tokens │
+        5h % bar reset │ 7d % bar reset │ cost │ session time │ health marks │
+        skills │ venv │ :ports
+
+    The line is made for a 120-column window. When it does not fit `width`, things go in
+    this order, each only if the line is still too wide:
+
+      1. venv and ports, 2. skills, 3. the 5h/7d reset countdowns, 4. session time,
+      5. healthy health marks, last one first (plugins, then CC, then mcp),
+      6. marks that need attention, last one first, each shown by name ('▲ Gmail failed'); when
+         the last text goes, one bare marker (▲, red for a failure, else amber) stands in for
+         all of them, and it outlasts everything below except model and percentages,
+      7. the session name,
+      8. the branch: first project and branch are squeezed into the room left (the longer
+         loses characters from its middle, neither below 14), then the branch is cut to
+         'live-usage…', then dropped (with its dirty counts),
+      9. the project: squeezed down to 14 characters as the room shrinks, then dropped,
+     10. the ctx tokens, 11. the bars (7d, then 5h, then ctx), 12. the cost, 13. the bare
+         marker.
+
+    Model and the three percentages always stay. Session time sits between the countdowns
+    and the health marks: it is cheap and the least useful of them.
+    """
+    now = time.time() if now is None else now
+    cw = data.get("context_window", {}) or {}
+    ex = extras or {}
+
+    meters = [("ctx", context_pct(cw), "ctx", context_tokens(cw))]
     if show_usage:
         usage = usage or {}
         for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
             w = usage.get(key)
-            if w is None:
-                parts.append(meter(label, None, icon=key))
-            else:
-                left = w["resets_at"] - now if w["resets_at"] else None
-                parts.append(meter(label, w["pct"], fmt_until(left), key, pct_first=True))
+            left = fmt_until(w["resets_at"] - now) if w and w["resets_at"] else ""
+            meters.append((label, w["pct"] if w else None, key, left))
+    head = model_head(data)
+    cost = fmt_cost(float((data.get("cost", {}) or {}).get("total_cost_usd", 0.0) or 0.0))
+    session = session_time(data)
+    tag = name_tag(ex["name"]) if ex.get("name") else ""
+    skills = f"{ic('skills')}{DIM}skills{RST} {ex['skills']}" if ex.get("skills") else ""
+    marks = list(ex.get("marks") or [])
+    marker = ""
+    if any(level for _, level in marks):
+        marker = f"{RED if any(level == 2 for _, level in marks) else AMBER}{ICON['warn']}{RST}"
 
-    parts.append(fmt_cost(float(cost.get("total_cost_usd", 0.0) or 0.0)))
-    dur = fmt_duration(int(cost.get("total_duration_ms", 0) or 0))
-    if dur:
-        parts.append(f"{ic('duration')}{DIM}session {dur}{RST}")
+    proj = ex.get("proj") or ""
+    branch, flags = ex.get("git") or ("", [])
 
-    if workspace:
-        ws_s = workspace_line(data)
-        if ws_s:
-            parts.append(ws_s)
-    return SEP.join(parts)
+    def where(s, rest):
+        """The project › branch item. Once the branch is being given up ('fit', 'short' or
+        gone) the item is squeezed into what `rest` (the other items, as they would be
+        joined) leaves of the width; the project never goes below MIN_NAME characters."""
+        p, b, f = proj, branch, flags
+        if s["branch"] is None:
+            b, f = "", []
+        elif s["branch"] == "short":
+            b = short_branch(b)
+        if s["branch"] != "full" and width:
+            taken = visible_width(SEP.join(rest)) + visible_width(SEP)
+            if s["name"] and tag:
+                taken += visible_width(tag) + 1
+            p, b = shrink_where(p, b, f, width - taken)
+        if s["proj"] is None:
+            p = ""
+        return _where_text(p, b, f)
 
+    def items(s):
+        out = [head]
+        for i, (label, p, icon, suffix) in enumerate(meters):
+            show = s["tokens"] if i == 0 else s["countdown"]
+            out.append(meter(label, p, icon, with_bar=i < s["bars"], suffix=suffix if show else ""))
+        if s["cost"]:
+            out.append(cost)
+        if s["session"] and session:
+            out.append(session)
+        out += [text for i, (text, _) in enumerate(marks) if i not in s["dropped"]]
+        if s["marker"] and marker:
+            out.append(marker)
+        if s["skills"] and skills:
+            out.append(skills)
+        if s["extras"]:
+            out += [x for x in (ex.get("venv"), ex.get("ports")) if x]
+        first = " ".join(x for x in (where(s, out), tag if s["name"] else "") if x)
+        return [first] + out if first else out
 
-def workspace_line(data, width=None):
-    """Project › git branch, then venv and ports. `width` defaults to the window's."""
-    ws = data.get("workspace", {}) or {}
-    cwd = ws.get("current_dir") or ws.get("project_dir") or data.get("cwd") or os.getcwd()
-    proj = Path(cwd).name if cwd else ""
-    where = where_item(proj, git_info(cwd), width or line_width())
-    parts = [where] if where else []
-    for extra in (venv_tag(), ports_tag()):
-        if extra:
-            parts.append(extra)
-    return SEP.join(parts)
+    # The drop order, as patches applied one after the other to the state.
+    steps = [{"extras": False}, {"skills": False}, {"countdown": False}, {"session": False}]
+    healthy = [i for i, (_, level) in enumerate(marks) if level == 0]
+    needy = [i for i, (_, level) in enumerate(marks) if level]
+    steps += [{"dropped": i} for i in reversed(healthy)]
+    steps += [{"dropped": i, "marker": k == len(needy) - 1} for k, i in enumerate(reversed(needy))]
+    steps += [{"name": False}, {"branch": "fit"}, {"branch": "short"}, {"branch": None},
+              {"proj": None},
+              {"tokens": False}, {"bars": 2}, {"bars": 1}, {"bars": 0}, {"cost": False}, {"marker": False}]
+
+    state = {"extras": True, "skills": True, "countdown": True, "session": True, "dropped": set(),
+             "marker": False, "name": True, "branch": "full", "proj": "full", "tokens": True,
+             "bars": len(meters), "cost": True}
+    best = items(state)
+    for step in [None] + steps:
+        if step:
+            step = dict(step)
+            if "dropped" in step:
+                state["dropped"] = state["dropped"] | {step.pop("dropped")}
+            state.update(step)
+            best = items(state)
+        if width is None or visible_width(SEP.join(best)) <= width:
+            break
+    return SEP.join(best)
 
 
 def main():
     if "--refresh" in sys.argv:
+        # The spawning render created the lock and passed its token; a manual run takes its own.
+        token = sys.argv[sys.argv.index("--lock-token") + 1] if "--lock-token" in sys.argv[:-1] else None
+        if token is None:
+            token = f"{os.getpid()}-{time.time_ns()}"
+            if not _take_lock(time.time(), token):
+                return
+        _arm_deadline(token)
         try:
             refresh_cache()
         finally:
-            USAGE_LOCK.unlink(missing_ok=True)
+            _release_lock(token)
         return
     mode = os.environ.get("STATUSLINE_ICONS", "none")
     if "--icons" in sys.argv[:-1]:
         mode = sys.argv[sys.argv.index("--icons") + 1]
-    set_icons(mode)
+    set_icons(effective_icons(mode))
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
@@ -962,27 +1562,21 @@ def main():
         now = time.time()
         stdin_rl = data.get("rate_limits") or {}
         live = None
-        show_usage = bool(stdin_rl)
+        show_usage = True  # unknown windows read "5h --", never vanish
         if os.environ.get("STATUSLINE_LIVE_USAGE", "1") != "0":
             cache = load_usage_cache()
             live = cache.get("usage")
             if read_oauth_token() or live:
-                show_usage = True
                 maybe_refresh(cache, now)
-        usage = merge_usage(stdin_rl, live, now)
+        try:
+            usage = merge_usage(stdin_rl, live, now)
+        except Exception:
+            usage = merge_usage(stdin_rl, None, now)  # a bad cache must not hide the live numbers
         known = any(usage.values())
-        # Session and usage first, then workspace and health, packed into as
-        # many lines as the window needs: whole items wrap, none get cut off.
-        width = line_width()
-        texts = [format_statusline(data, usage if known else None, now, show_usage, workspace=False),
-                 workspace_line(data, width)]
-        if SHOW_HEALTH:
-            try:
-                texts.append(health_line(data))
-            except Exception:
-                pass
-        items = [item for t in texts if t for item in t.split(SEP)]
-        line = "\n".join(flow(items, width or 10**6))
+        probes = ProbeCache(CLAUDE_DIR / PROBE_CACHE_NAME, now)
+        # One line, fitted to the window; every slow probe sits behind the probe cache.
+        line = format_statusline(data, usage if known else None, now, show_usage,
+                                 gather_extras(data, probes), line_width())
         if SHOW_AGENTS:
             try:
                 agents = format_agents(running_subagents(data.get("transcript_path"), now))
@@ -991,6 +1585,7 @@ def main():
             except Exception:
                 pass
         print(line)
+        probes.save()  # never raises
     except Exception:
         print("Claude | --")
     sys.exit(0)

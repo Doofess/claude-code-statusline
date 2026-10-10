@@ -3,9 +3,10 @@
 A unified, modular status line for [Claude Code](https://claude.com/claude-code) — the same informative bar in every project, zero per-repo config.
 
 ```
-Opus 4.6 · high │ ctx ▰▰▰▱▱▱▱▱ 42% 84k/200k │ 5h ▰▰▰▰▱▱▱▱ 56% 14m │ 7d ▰▰▰▰▱▱▱▱ 48% 5d2h │ $0.37 │ 12m │ my-app › main +2 ~5 ?1 │ venv:.venv │ :3000,8080
-cc 2.1.296 ✓ │ plugins ✓ │ mcp 16 ▲ discord
+my-app › main ~2 “fix-login-redirect” │ Opus 4.6 · high │ ctx 42% █████ 84k/200k │ 5h 56% █████ 14m │ 7d 48% █████ 5d2h │ $0.37 │ session 12m │ mcp 16 ✓ │ CC 2.1.296 ✓ │ plugins ✓ │ skills 69 │ venv:.venv │ :3000,8080
 ```
+
+One line, always. It is made for a 120-column window, fits itself to the width it is given, and never wraps.
 
 ## Why
 
@@ -15,22 +16,47 @@ This is one Python file that gives you vital session info everywhere and quietly
 
 ## What it shows
 
-| Section | Meaning |
-|---|---|
-| **model · effort** | Model display name, colored by family (Opus orange, Sonnet blue, Haiku teal, Fable pink), then the reasoning effort level (low → max) when set |
-| **ctx ▰▰▱▱ N% used/size** | Context window usage as a percentage and in tokens — shifts green → amber → red as it fills |
-| **5h / 7d** | Plan usage for both windows, account-wide (see below), plus time until each window resets. `--` until the first reading arrives |
-| **$X.XX** | Session cost in USD (bold green) |
-| **duration** | Session wall-clock time |
-| **project › git** | Working directory name, then branch + dirty counts: `+staged ~modified ?untracked`. Branch is green when clean, amber when dirty |
-| **cc** *(line 2)* | Claude Code version: `✓` up to date, `↑ X` newer release on your update channel, `↑ X restart` already installed and waiting for a restart |
-| **plugins** *(line 2)* | `✓`, or `↑ N /reload-plugins` when N enabled plugins were updated on disk after this session loaded them |
-| **mcp** *(line 2)* | MCP servers connected in this session; `▲ name` for any that failed to connect (read from Claude Code's per-session MCP logs, no extra connections) |
-| **agents** *(line 3, off by default: `SHOW_AGENTS = True`)* | Each running subagent: type and model in the model's color, effort, and context tokens. Up to 3, then `+N` |
-| **venv** | Active Python virtualenv or conda environment |
-| **:ports** | Common dev ports currently listening (3000, 5173, 8000, 8080, 9086, …) |
+Left to right:
 
-Every section after `model` and `ctx` is auto-detected — a Rust repo with no venv simply won't render a venv tag.
+| Item | Meaning |
+|---|---|
+| **project › branch ~N** | Working directory name, then the git branch with dirty counts: `+staged ~modified ?untracked`. Project is violet; the branch is green when clean, amber when dirty |
+| **“session-name”** | The session's name, only when it has one: the payload's `session_name` (set with `/rename`), else the newest `ai-title` / `agent-name` / `custom-title` entry in the last 256 KB of the transcript, as a lowercase hyphen slug of at most 28 characters. Kept in the probe cache by transcript size, so a render only reads the file again when it grew. A tag icon replaces the quotes with Nerd icons |
+| **model · effort** | Model display name, colored by family (Opus orange, Sonnet blue, Haiku teal, Fable pink), then the reasoning effort level (low → max) when set |
+| **ctx N% bar used/size** | Context window usage as a percentage, a bar and the tokens — shifts green → yellow → orange → red as it fills |
+| **5h / 7d** | Plan usage for both windows, account-wide (see below): percentage, bar, and the time until the window resets. `--` until the first reading arrives |
+| **$X.XX** | Session cost in USD (bold green) |
+| **session time** | Session wall-clock time: `session 12m`, or a clock icon with Nerd icons |
+| **health marks** | `mcp 3 ✓` (servers connected in this session, read from Claude Code's per-session MCP logs), `CC 2.1.296 ✓` (Claude Code version), `plugins ✓`. Each turns into a named warning when something is wrong: `▲ Gmail failed` (red), `↑ 2.2 available` or `↑ restart for 2.2` (amber), `~ reload` (amber, enabled plugins changed on disk after this session loaded them) |
+| **skills N** | Skills available to the session |
+| **venv / :ports** | Active Python virtualenv or conda environment, and common dev ports currently listening (3000, 5173, 8000, 8080, 9086, …). Only shown when something is found |
+| **agents** *(a second line, off by default: `SHOW_AGENTS = True`)* | Each running subagent: type and model in the model's color, effort, and context tokens. Up to 3, then `+N` |
+
+### Fitting the window
+
+The line must be no wider than `COLUMNS` minus 4 (Claude Code pads the right edge). A wide window shows everything; a narrow one drops items in this order, each only while the line is still too wide:
+
+1. venv and ports
+2. skills
+3. the 5h / 7d reset countdowns
+4. session time
+5. healthy health marks (plugins, then CC, then mcp)
+6. health marks that need attention, last first, each by name; when the last text goes, one bare `▲` stands in for all of them (red for a failure, else amber). It outlasts everything below except model and percentages, so a failure is never invisible
+7. the session name
+8. the branch: first project and branch are squeezed into the room left (the longer loses characters from its middle, neither below 14), then the branch is cut to `live-usage…`, then dropped
+9. the project: squeezed down to 14 characters, then dropped
+10. the ctx tokens
+11. the bars (7d, then 5h, then ctx)
+12. the cost
+13. the bare `▲`
+
+Model and the three percentages always stay.
+
+### Icons
+
+Plain mode (the default) uses only glyphs that Consolas, Cascadia, Menlo and DejaVu have: bars of 5 `█` cells, `✓ ↑ ▲ ~` for the marks. With `--icons nerd` every item gets a Nerd Font icon and the bars become 3 slanted segments. The classic Windows console host cannot draw Nerd Font glyphs, so `nerd` falls back to plain there (set `STATUSLINE_FORCE_ICONS=1` to skip that check).
+
+Everything slow is auto-detected and cached (git 3 s, ports 10 s, health 10 s, skill count 60 s), so a render stays at a few tens of milliseconds.
 
 ## Install
 
@@ -88,18 +114,18 @@ Everything lives in the top of `statusline.py`.
 
 - **Ports** — edit `COMMON_PORTS` to match your stack.
 - **Colors** — tweak the 256-color constants (`MODEL`, `PROJECT`, `GREEN`, `AMBER`, `CYAN`) and the `STAGES` / `RED` used for percentages (green, yellow from 50%, orange from 70%, red from 85%).
-- **Extra lines** — `SHOW_HEALTH = False` / `SHOW_AGENTS = False` turn off the health and subagent lines.
+- **Health and subagents** — `SHOW_HEALTH = False` leaves out the health marks and the skill count; `SHOW_AGENTS = True` adds the subagent line.
 - **Model colors** — `MODEL_COLORS` maps model families to colors.
 - **Usage refresh** — `USAGE_TTL` sets how often live usage is fetched (default 60 s). `STATUSLINE_LIVE_USAGE=0` turns live fetching off.
-- **Sections** — add your own by appending to `parts` in `format_statusline()`.
+- **Items and drop order** — `format_statusline()` builds the items and lists the drop order as patches (`steps`); its docstring is the reference.
 
-No framework, no plugin system — one function per section, all readable in a few minutes.
+No framework, no plugin system — all readable in a few minutes.
 
 ## How it works
 
 Claude Code pipes a JSON blob to whatever command you set as `statusLine`, containing the current session's model, context-window usage, cost, rate-limits, and workspace info. This script reads that JSON from stdin, runs a handful of fast local probes (git, env vars, port checks), and prints the formatted bar to stdout.
 
-Each probe has a tight timeout: one `git status` call (≤1 s) and port checks run in parallel (50 ms). A render takes ~200 ms on Windows, which matters because Claude Code cancels a render that is still running when the next update arrives.
+Each probe has a tight timeout (one `git status` call ≤1 s, port checks in parallel, 20 ms) and keeps its result in a small shared cache file (`~/.claude/statusline-probe-cache.json`) for a few seconds. A warm render takes about 40 ms on Windows (a cold cache about 110 ms), which matters because Claude Code cancels a render that is still running when the next update arrives. The status line runs fine as `python -S ~/.claude/statusline.py --icons nerd`: it needs only the standard library.
 
 ### Why the usage numbers are accurate
 

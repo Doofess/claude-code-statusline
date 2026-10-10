@@ -1,8 +1,10 @@
 """Tests for statusline.py. Run: python -m unittest test_statusline"""
 
+import os
 import pathlib
 import re
 import sys
+import time
 import unittest
 
 import statusline as sl
@@ -64,7 +66,7 @@ class MergeUsage(unittest.TestCase):
         usage = sl.merge_usage(stdin_rl(five=(55, NOW - 60), seven=(40, NOW + HOUR)), None, NOW)
         out = plain(sl.format_statusline({"model": {"display_name": "Opus"}}, usage=usage, now=NOW))
         self.assertRegex(out, r"5h\s+--")
-        self.assertNotRegex(out, r"5h ↔ 0%")
+        self.assertNotRegex(out, r"5h 0%")
 
     def test_no_data_is_unknown_not_zero(self):
         got = sl.merge_usage({}, None, NOW)
@@ -92,23 +94,40 @@ class Render(unittest.TestCase):
                               "cache_creation_input_tokens": 787, "cache_read_input_tokens": 134_488},
         }
         out = plain(sl.format_statusline({"context_window": cw}, now=NOW, show_usage=False))
-        self.assertRegex(out, r"ctx ↔ 14% \S+ 135k/1M")
+        self.assertRegex(out, r"ctx 14% \S+ 135k/1M")
 
-    def test_context_tokens_zero_before_first_reply(self):
-        cw = {"context_window_size": 200_000, "used_percentage": 0, "current_usage": None}
+    def test_no_fake_zero_tokens_before_first_reply(self):
+        for usage in (None, {}):
+            cw = {"context_window_size": 200_000, "used_percentage": 0, "current_usage": usage}
+            out = plain(sl.format_statusline({"context_window": cw}, now=NOW, show_usage=False))
+            self.assertRegex(out, r"ctx 0% \S+ │ \$0.00$")
+            self.assertNotIn("/200k", out)
+
+    def test_ctx_is_unknown_without_a_context_window_or_percentage(self):
+        for data in ({}, {"context_window": None}, {"context_window": {}},
+                     {"context_window": {"context_window_size": 1_000_000, "current_usage": {}}},
+                     {"context_window": {"context_window_size": 1_000_000, "used_percentage": None}}):
+            out = plain(sl.format_statusline(data, now=NOW, show_usage=False))
+            self.assertIn("ctx --", out, data)
+            self.assertNotIn("0%", out, data)
+            self.assertNotIn(sl.BAR, out, data)
+            self.assertNotIn("/", out, data)
+
+    def test_ctx_with_a_window_but_no_usage_has_a_percentage_and_no_tokens(self):
+        cw = {"context_window_size": 1_000_000, "used_percentage": 14, "current_usage": None}
         out = plain(sl.format_statusline({"context_window": cw}, now=NOW, show_usage=False))
-        self.assertRegex(out, r"ctx ↔ 0% \S+ 0/200k")
+        self.assertIn(f"ctx 14% {plain(sl.bar(14))} │", out)
 
     def test_ctx_label_takes_the_percentage_color_like_usage(self):
         raw = sl.format_statusline({"context_window": {"used_percentage": 43}}, now=NOW, show_usage=False)
         c = sl.color_pct(43)
-        self.assertIn(f"{c}ctx{sl.RST}", raw)
-        self.assertIn(f"{c}43%{sl.RST}", raw)
+        self.assertIn(f"{c}ctx{sl.RST} {c}43%{sl.RST}", raw)
 
     def test_duration_is_labelled_as_session_time(self):
         data = {"cost": {"total_duration_ms": 5_580_000}}
         out = plain(sl.format_statusline(data, now=NOW, show_usage=False))
         self.assertIn("session 1h33m", out)
+        self.assertEqual(plain(sl.session_time({"cost": {"total_duration_ms": 0}})), "")
 
     def test_countdown_drops_zero_parts(self):
         self.assertEqual([sl.fmt_until(s) for s in (5 * 24 * HOUR, 5 * 24 * HOUR + 2 * HOUR, 3 * HOUR,
@@ -128,11 +147,11 @@ class Render(unittest.TestCase):
     def test_shows_effort_level_after_model(self):
         data = {"model": {"display_name": "Opus"}, "effort": {"level": "xhigh"}}
         out = plain(sl.format_statusline(data, now=NOW, show_usage=False))
-        self.assertTrue(out.startswith("Opus · xhigh  │"), out)
+        self.assertTrue(out.startswith("Opus · xhigh │"), out)
 
     def test_effort_omitted_when_absent(self):
         out = plain(sl.format_statusline({"model": {"display_name": "Opus"}}, now=NOW, show_usage=False))
-        self.assertTrue(out.startswith("Opus  │"), out)
+        self.assertTrue(out.startswith("Opus │"), out)
 
     def test_token_counts_are_compact(self):
         self.assertEqual([sl.fmt_tokens(n) for n in (0, 950, 1_000, 12_345, 135_277, 200_000, 1_000_000, 1_250_000)],
@@ -141,15 +160,14 @@ class Render(unittest.TestCase):
     def test_shows_live_percent_and_reset_countdown(self):
         usage = sl.merge_usage({}, live(five=(56, NOW + 14 * 60 + 5), seven=(48, NOW + 5 * 24 * HOUR + 2 * HOUR)), NOW)
         out = plain(sl.format_statusline({"model": {"display_name": "Opus"}}, usage=usage, now=NOW))
-        self.assertRegex(out, "5h ↔ 56% \\S+ 14m")
-        self.assertRegex(out, "7d ↔ 48% \\S+ 5d2h")
+        self.assertRegex(out, "5h 56% \\S+ 14m")
+        self.assertRegex(out, "7d 48% \\S+ 5d2h")
 
     def test_usage_label_takes_the_percentage_color(self):
         usage = sl.merge_usage({}, live(five=(56, NOW + HOUR)), NOW)
         raw = sl.format_statusline({"model": {"display_name": "Opus"}}, usage=usage, now=NOW)
         c = sl.color_pct(56)
-        self.assertIn(f"{c}5h{sl.RST}", raw)
-        self.assertIn(f"{c}56%{sl.RST}", raw)
+        self.assertIn(f"{c}5h{sl.RST} {c}56%{sl.RST} {sl.bar(56)}", raw)
 
 
 class VersionStatus(unittest.TestCase):
@@ -183,6 +201,98 @@ class PluginsNeedingReload(unittest.TestCase):
     def test_none_after_reload(self):
         loaded = sl._epoch("2026-10-09T19:00:00Z")
         self.assertEqual(sl.plugins_needing_reload(self.INSTALLED, {"a@m", "b@m"}, loaded), [])
+
+
+class PluginsLoadedAt(unittest.TestCase):
+    """plugins_loaded_at scans only what a transcript gained since the last scan."""
+
+    RELOAD = b"<command-name>/reload-plugins</command-name>"
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = pathlib.Path(self.tmp.name) / "t.jsonl"
+
+    def line(self, ts, text="hi"):
+        import json
+        from datetime import datetime, timezone
+        iso = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+        return json.dumps({"timestamp": iso, "message": text}).encode() + b"\n"
+
+    def append(self, data):
+        with open(self.path, "ab") as f:
+            f.write(data)
+
+    def test_full_scan_without_state_is_unchanged(self):
+        self.path.write_bytes(self.line(NOW) + self.line(NOW + 5, self.RELOAD.decode()) + self.line(NOW + 9))
+        self.assertEqual(sl.plugins_loaded_at(self.path), NOW + 5)
+        self.path.write_bytes(self.line(NOW) + self.line(NOW + 9))
+        self.assertEqual(sl.plugins_loaded_at(self.path), NOW)
+        self.assertIsNone(sl.plugins_loaded_at(self.path.with_name("missing.jsonl")))
+        self.assertIsNone(sl.plugins_loaded_at(None))
+
+    def test_next_scan_reads_only_the_appended_bytes(self):
+        state = {}
+        self.path.write_bytes(self.line(NOW) + self.line(NOW + 5, self.RELOAD.decode()))
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 5)
+        self.assertEqual(state["size"], self.path.stat().st_size)
+        # Blank out the old marker without changing the size: only a rescan would notice.
+        raw = self.path.read_bytes().replace(self.RELOAD, b"x" * len(self.RELOAD))
+        self.path.write_bytes(raw)
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 5)
+        self.append(self.line(NOW + 20))
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 5)
+        self.append(self.line(NOW + 30, self.RELOAD.decode()))
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 30)
+        self.assertEqual(state["size"], self.path.stat().st_size)
+
+    def test_a_half_written_last_line_is_picked_up_once_complete(self):
+        state = {}
+        self.path.write_bytes(self.line(NOW))
+        sl.plugins_loaded_at(self.path, state)
+        full = self.line(NOW + 7, self.RELOAD.decode())
+        self.append(full[:25])
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW)
+        self.append(full[25:])
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 7)
+
+    def test_shrunk_or_replaced_transcript_is_rescanned(self):
+        state = {}
+        self.path.write_bytes(self.line(NOW) + self.line(NOW + 5, self.RELOAD.decode()) + self.line(NOW + 9))
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 5)
+        self.path.write_bytes(self.line(NOW + 100))  # shorter: a new session file
+        self.assertEqual(sl.plugins_loaded_at(self.path, state), NOW + 100)
+        other = self.path.with_name("other.jsonl")
+        other.write_bytes(self.line(NOW + 200) + self.line(NOW + 201) + self.line(NOW + 202))
+        self.assertEqual(sl.plugins_loaded_at(other, state), NOW + 200)  # same-or-larger size, other path
+
+    def test_health_probe_keeps_the_scan_state_in_the_probe_cache(self):
+        import tempfile
+        from unittest import mock
+        self.path.write_bytes(self.line(NOW))
+        data = {"session_id": "s", "version": "2.1.296", "transcript_path": str(self.path)}
+        cache_path = pathlib.Path(self.tmp.name) / sl.PROBE_CACHE_NAME
+        seen, real = [], sl.plugins_loaded_at
+
+        def spy(path, state=None):
+            seen.append(dict(state or {}))
+            return real(path, state)
+
+        with mock.patch.object(sl, "read_mcp_logs", return_value=None), \
+                mock.patch.object(sl, "CLAUDE_DIR", pathlib.Path(self.tmp.name)), \
+                mock.patch.object(sl, "NATIVE_VERSIONS", pathlib.Path(self.tmp.name) / "v"), \
+                mock.patch.object(sl, "plugins_loaded_at", spy):
+            cache = sl.ProbeCache(cache_path, NOW)
+            sl._health_probe(data, cache)
+            cache.save()
+            first_size = self.path.stat().st_size
+            self.append(self.line(NOW + 3))
+            cache = sl.ProbeCache(cache_path, NOW + 11)
+            sl._health_probe(data, cache)
+        self.assertEqual(seen[0], {})
+        self.assertEqual(seen[1]["path"], str(self.path))
+        self.assertEqual(seen[1]["size"], first_size)
 
 
 class McpStatus(unittest.TestCase):
@@ -278,36 +388,65 @@ class McpNames(unittest.TestCase):
         self.assertEqual(got, ["discord", "chrome-devtools", "Google-Drive", "bigquery"])
 
 
-class HealthLine(unittest.TestCase):
+class HealthMarks(unittest.TestCase):
+    """health_marks() -> [(text, level)] for mcp, Claude Code and plugins; level 0 ok, 1 amber, 2 red."""
+
+    def tearDown(self):
+        sl.set_icons("none")
+
+    def texts(self, *args):
+        return [(plain(t), lvl) for t, lvl in sl.health_marks(*args)]
+
     def test_all_good(self):
-        out = plain(sl.format_health("2.1.296", ("ok", None), [], (["a"] * 16, [])))
-        self.assertEqual(out, "Claude Code 2.1.296 ✓  │  plugins ✓  │  mcp 16 connected")
+        got = self.texts("2.1.296", ("ok", None), [], (["a"] * 3, []))
+        self.assertEqual(got, [("mcp 3 ✓", 0), ("CC 2.1.296 ✓", 0), ("plugins ✓", 0)])
 
-    def test_mcp_none_connected_some_failed(self):
-        out = plain(sl.format_health(None, ("unknown", None), None, ([], ["discord", "a", "b"])))
-        self.assertEqual(out, "mcp ▲ discord +2 failed")
+    def test_healthy_marks_are_green(self):
+        for text, _ in sl.health_marks("2.1.296", ("ok", None), [], (["a"], [])):
+            self.assertIn(f"{sl.GREEN}{sl.ICON['ok']}{sl.RST}", text)
 
-    def test_mcp_one_failed(self):
-        out = plain(sl.format_health(None, ("unknown", None), None, (["a"] * 13, ["discord"])))
-        self.assertEqual(out, "mcp 13 connected · ▲ discord failed")
+    def test_failed_server_is_named_in_red(self):
+        marks = sl.health_marks(None, ("unknown", None), None, (["a"] * 13, ["Gmail"]))
+        self.assertEqual([(plain(t), lvl) for t, lvl in marks], [("▲ Gmail failed", 2)])
+        self.assertIn(sl.RED, marks[0][0])
+        got = self.texts(None, ("unknown", None), None, ([], ["Gmail", "x", "y"]))
+        self.assertEqual(got, [("▲ Gmail +2 failed", 2)])
 
-    def test_skill_count_follows_plugins(self):
-        out = plain(sl.format_health("2.1.296", ("ok", None), [], None, skills=69))
-        self.assertEqual(out, "Claude Code 2.1.296 ✓  │  plugins ✓  │  skills 69")
+    def test_long_server_names_are_shortened(self):
+        got = self.texts(None, ("unknown", None), None, (["a"], ["a-very-long-server-name-x"]))
+        self.assertEqual(got[0][0], "▲ a-ver…name-x failed")
 
-    def test_needs_attention(self):
-        out = plain(sl.format_health("2.1.290", ("restart", "2.1.296"), ["p1", "p2", "p3"],
-                                     (["a"] * 15, ["discord", "resend"])))
-        self.assertEqual(out, "Claude Code 2.1.290 ↑ restart for 2.1.296"
-                              "  │  plugins ↻ 3 updated · run /reload-plugins"
-                              "  │  mcp 15 connected · ▲ discord +1 failed")
+    def test_update_and_restart_are_amber(self):
+        marks = sl.health_marks("2.1.290", ("update", "2.2"), None, None)
+        self.assertEqual([(plain(t), lvl) for t, lvl in marks], [("↑ 2.2 available", 1)])
+        self.assertIn(sl.AMBER, marks[0][0])
+        self.assertEqual(self.texts("2.1.290", ("update", None), None, None), [("↑ update", 1)])
+        self.assertEqual(self.texts("2.1.290", ("restart", "2.1.296"), None, None),
+                         [("↑ restart for 2.1.296", 1)])
 
-    def test_update_available_says_so(self):
-        out = plain(sl.format_health("2.1.290", ("update", "2.1.296"), None, None))
-        self.assertEqual(out, "Claude Code 2.1.290 ↑ 2.1.296 available")
+    def test_plugins_to_reload_are_amber(self):
+        marks = sl.health_marks(None, ("unknown", None), ["p1", "p2"], None)
+        self.assertEqual([(plain(t), lvl) for t, lvl in marks], [("~ reload", 1)])
+        self.assertIn(sl.AMBER, marks[0][0])
 
-    def test_sections_without_data_are_hidden(self):
-        self.assertEqual(plain(sl.format_health(None, ("unknown", None), None, None)), "")
+    def test_running_version_without_a_verdict_is_shown_plain(self):
+        self.assertEqual(self.texts("2.1.296", ("unknown", None), None, None), [("CC 2.1.296", 0)])
+
+    def test_marks_without_data_are_hidden(self):
+        self.assertEqual(sl.health_marks(None, ("unknown", None), None, None), [])
+        self.assertEqual(sl.health_marks(None, ("unknown", None), None, ([], [])), [])
+
+    def test_nerd_marks_use_nerd_icons(self):
+        sl.set_icons("nerd")
+        got = self.texts("2.1.296", ("ok", None), [], (["a"], []))
+        self.assertEqual([t for t, _ in got], [f"{sl.ICON['mcp']} mcp 1 {sl.ICON['ok']}",
+                                                f"{sl.ICON['cc']} CC 2.1.296 {sl.ICON['ok']}",
+                                                f"{sl.ICON['plugins']} plugins {sl.ICON['ok']}"])
+        got = self.texts("2.1.290", ("update", "2.2"), ["p"], (["a"], ["Gmail"]))
+        self.assertEqual([t for t, _ in got], [f"{sl.ICON['warn']} Gmail failed",
+                                                f"{sl.ICON['up']} 2.2 available",
+                                                f"{sl.ICON['reload']} reload"])
+        self.assertNotEqual(sl.ICON["reload"], sl.ICON["up"])
 
 
 class Subagents(unittest.TestCase):
@@ -342,8 +481,8 @@ class Subagents(unittest.TestCase):
             {"type": "Plan", "model": "claude-opus-5-5", "effort": "high", "tokens": 5_000},
         ]
         self.assertEqual(plain(sl.format_agents(agents)),
-                         "agents 4  │  claude-code-guide Haiku 5.5 · medium 50k"
-                         "  │  Explore Sonnet 5.5 120k  │  general-purpose  │  +1")
+                         "agents 4 │ claude-code-guide Haiku 5.5 · medium 50k"
+                         " │ Explore Sonnet 5.5 120k │ general-purpose │ +1")
 
     def test_agent_name_and_model_use_model_color(self):
         out = sl.format_agents([{"type": "Explore", "model": "claude-sonnet-5-5", "effort": None, "tokens": 1}])
@@ -371,32 +510,25 @@ class ModelColors(unittest.TestCase):
 
 
 class Layout(unittest.TestCase):
-    DATA = {"model": {"display_name": "Opus"}, "workspace": {"current_dir": "C:/work/my-app"}}
-
-    def test_workspace_can_move_off_line_one(self):
-        line1 = plain(sl.format_statusline(self.DATA, now=NOW, show_usage=False, workspace=False))
-        self.assertNotIn("my-app", line1)
-        self.assertTrue(plain(sl.workspace_line(self.DATA)).startswith("my-app"))
-
     def test_bars_use_full_blocks(self):
         out = plain(sl.bar(50))
-        self.assertEqual(out, "█" * 8)
+        self.assertEqual(out, "█" * 5)
 
     def test_plain_bar_lights_one_block_for_any_usage(self):
-        self.assertEqual(sl.bar(2), f"{sl.color_pct(2)}█{sl.RST}{sl.BAR_TRACK}{'█' * 7}{sl.RST}")
-        self.assertEqual(sl.bar(0), f"{sl.color_pct(0)}{sl.RST}{sl.BAR_TRACK}{'█' * 8}{sl.RST}")
+        self.assertEqual(sl.bar(2), f"{sl.color_pct(2)}█{sl.RST}{sl.BAR_TRACK}{'█' * 4}{sl.RST}")
+        self.assertEqual(sl.bar(0), f"{sl.color_pct(0)}{sl.RST}{sl.BAR_TRACK}{'█' * 5}{sl.RST}")
 
     def test_long_branch_is_not_capped_when_there_is_room(self):
         branch = "live-usage-and-redesign-of-the-meters"
         out = plain(sl.where_item("claude-code-statusline", (branch, []), width=116))
-        self.assertEqual(out, f"claude-code-statusline  ›  {branch}")
+        self.assertEqual(out, f"claude-code-statusline › {branch}")
 
     def test_project_and_branch_shrink_from_the_middle_to_fit(self):
         proj, branch = "claude-code-statusline", "live-usage-and-redesign-of-the-meters"
         out = plain(sl.where_item(proj, (branch, ["+1"]), width=40))
         self.assertLessEqual(len(out), 40, out)
         self.assertGreaterEqual(len(out), 38, out)  # shortened just enough
-        p, b = out.split("  ›  ")
+        p, b = out.split(" › ")
         self.assertIn("…", p + b)
         self.assertTrue(b.endswith(" +1"), out)
         for short, full in ((p, proj), (b[:-3], branch)):
@@ -410,51 +542,9 @@ class Layout(unittest.TestCase):
         self.assertEqual(sl.mid_trunc("claude-code-statusline", 20), "claude-co…statusline")
 
 
-class Flow(unittest.TestCase):
-    def test_items_move_whole_to_the_next_line(self):
-        items = ["aaaa", "bbbb", "cccc", "dd"]
-        # "aaaa  │  bbbb" is 13 wide; adding "  │  cccc" would make 22.
-        self.assertEqual([plain(l) for l in sl.flow(items, 20)],
-                         ["aaaa  │  bbbb", "cccc  │  dd"])
-
-    def test_an_item_wider_than_the_line_gets_a_line_of_its_own(self):
-        self.assertEqual([plain(l) for l in sl.flow(["x" * 30, "y"], 20)], ["x" * 30, "y"])
-
-    def test_no_lonely_last_item_when_one_can_move_down(self):
-        items = ["aa", "bb", "cc", "dddd"]
-        # Greedy gives "aa  │  bb  │  cc" then "dddd" alone; "cc" moves down to keep it company.
-        self.assertEqual([plain(l) for l in sl.flow(items, 20)], ["aa  │  bb", "cc  │  dddd"])
-
-    def test_balance_never_overflows_the_last_line(self):
-        items = ["aa", "bb", "cc", "d" * 19]
-        self.assertEqual([plain(l) for l in sl.flow(items, 20)], ["aa  │  bb  │  cc", "d" * 19])
-
+class VisibleWidth(unittest.TestCase):
     def test_width_ignores_color_codes(self):
         self.assertEqual(sl.visible_width(f"{sl.GREEN}abc{sl.RST}"), 3)
-
-    def test_rendered_lines_fit_the_window(self):
-        import io, json, os
-        from contextlib import redirect_stdout
-        from unittest import mock
-        data = {"model": {"display_name": "Opus 5.5", "id": "claude-opus-5-5"}, "effort": {"level": "high"},
-                "context_window": {"used_percentage": 11, "context_window_size": 1_000_000,
-                                   "current_usage": {"input_tokens": 135_000}},
-                "rate_limits": {"five_hour": {"used_percentage": 14, "resets_at": 9e9},
-                                "seven_day": {"used_percentage": 54, "resets_at": 9e9}},
-                "cost": {"total_cost_usd": 47.5, "total_duration_ms": 720_000},
-                "workspace": {"current_dir": os.getcwd()}}
-        buf = io.StringIO()
-        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))), \
-                mock.patch.object(sys, "argv", ["statusline.py", "--icons", "nerd"]), \
-                mock.patch.dict(os.environ, {"COLUMNS": "120", "STATUSLINE_LIVE_USAGE": "0"}), \
-                redirect_stdout(buf), self.assertRaises(SystemExit):
-            sl.main()
-        sl.set_icons("none")
-        lines = buf.getvalue().rstrip("\n").split("\n")
-        self.assertGreaterEqual(len(lines), 2)
-        for line in lines:
-            self.assertLessEqual(sl.visible_width(line), 120 - sl.EDGE, plain(line))
-        self.assertIn("47.50", plain(buf.getvalue()))
 
 
 class SlantedBars(unittest.TestCase):
@@ -463,17 +553,18 @@ class SlantedBars(unittest.TestCase):
     def tearDown(self):
         sl.set_icons("none")
 
-    def test_nerd_bar_is_five_slanted_segments(self):
+    def test_nerd_bar_is_three_slanted_segments(self):
         sl.set_icons("nerd")
-        self.assertEqual(plain(sl.bar(60)), self.SEG * 5)
+        self.assertEqual(plain(sl.bar(60)), self.SEG * 3)
+        self.assertEqual(self.SEG, sl.NERD_ICONS["segment"])
 
     def test_filled_segments_take_the_ramp_color_and_the_rest_the_track(self):
         sl.set_icons("nerd")
-        self.assertEqual(sl.bar(60), f"{sl.color_pct(60)}{self.SEG * 3}{sl.RST}{sl.BAR_TRACK}{self.SEG * 2}{sl.RST}")
+        self.assertEqual(sl.bar(60), f"{sl.color_pct(60)}{self.SEG * 2}{sl.RST}{sl.BAR_TRACK}{self.SEG}{sl.RST}")
 
     def test_any_usage_shows_at_least_one_segment(self):
         sl.set_icons("nerd")
-        self.assertIn(f"{sl.color_pct(3)}{self.SEG}{sl.RST}{sl.BAR_TRACK}{self.SEG * 4}", sl.bar(3))
+        self.assertIn(f"{sl.color_pct(3)}{self.SEG}{sl.RST}{sl.BAR_TRACK}{self.SEG * 2}", sl.bar(3))
 
 
 class Icons(unittest.TestCase):
@@ -485,27 +576,1198 @@ class Icons(unittest.TestCase):
 
     def test_plain_by_default(self):
         out = plain(sl.format_statusline(self.DATA, now=NOW, show_usage=False))
-        self.assertTrue(out.startswith("Opus  │  ctx"), out)
+        self.assertTrue(out.startswith("Opus │ ctx"), out)
         self.assertIn("$2.39", out)
 
     def test_nerd_icons(self):
         sl.set_icons("nerd")
         out = plain(sl.format_statusline(self.DATA, now=NOW, show_usage=False))
-        self.assertTrue(out.startswith("󱙺 Opus  │  󰠰 ctx"), out)
-        self.assertIn("󰇁 2.39", out)
-        health = plain(sl.format_health("2.1.296", ("ok", None), [], (["a"], ["discord"])))
-        self.assertEqual(health, "󰞷 Claude Code 2.1.296 󰗠  │  󰐱 plugins 󰗠"
-                                 "  │  󰒍 mcp 1 connected · 󰀦 discord failed")
-
-    def test_plugin_reload_icon_differs_from_version_arrow(self):
-        sl.set_icons("nerd")
-        out = plain(sl.format_health(None, ("unknown", None), ["p1", "p2"], None))
-        self.assertEqual(out, "󰐱 plugins \U000F0453 2 updated · run /reload-plugins")
-        self.assertNotEqual(sl.ICON["reload"], sl.ICON["up"])
+        self.assertTrue(out.startswith("\U000F167A Opus │ \U000F0830 ctx"), out)
+        self.assertIn("\U000F01C1 2.39", out)
+        self.assertEqual(sl.ICON["cost"], "\U000F01C1")
 
     def test_cost_is_bold_bright_green(self):
         out = sl.format_statusline(self.DATA, now=NOW, show_usage=False)
         self.assertIn("[1;38;5;46m$2.39", out)
+
+
+class SingleLine(unittest.TestCase):
+    """format_statusline(): the one line, its items and what it drops at each width."""
+
+    DATA = {"model": {"display_name": "Opus 5.5", "id": "claude-opus-5-5"}, "effort": {"level": "high"},
+            "context_window": {"used_percentage": 43, "context_window_size": 1_000_000,
+                               "current_usage": {"input_tokens": 430_000}},
+            "cost": {"total_cost_usd": 35.5, "total_duration_ms": 720_000}}
+    GIT = ("live-usage-and-redesign", [f"{sl.AMBER}~2{sl.RST}"])
+    PROJ = "claude-code-statusline"
+    NAME = "statusline-py-usage-accuracy"
+    OK = [("mcp 3 ✓", 0), ("CC 2.1.296 ✓", 0), ("plugins ✓", 0)]
+    BAD = [("▲ Gmail failed", 2), ("↑ 2.2 available", 1), ("~ reload", 1)]
+
+    def tearDown(self):
+        sl.set_icons("none")
+
+    def usage(self):
+        return sl.merge_usage({}, live(five=(74, NOW + 2 * HOUR + 600), seven=(69, NOW + 5 * 24 * HOUR + 14 * HOUR)), NOW)
+
+    def extras(self, marks=None, name=None, skills=69, ports="", venv="", git=GIT):
+        return {"proj": self.PROJ, "git": git, "name": name or "", "skills": skills,
+                "marks": list(marks or []), "ports": ports, "venv": venv}
+
+    def line(self, columns=None, **kw):
+        """The line for a window `columns` wide (main() gives format_statusline COLUMNS - EDGE)."""
+        width = None if columns is None else columns - sl.EDGE
+        return sl.format_statusline(self.DATA, self.usage(), NOW, True, self.extras(**kw), width)
+
+    def at(self, width, **kw):
+        out = plain(self.line(width, **kw))
+        self.assertNotIn("\n", out)
+        self.assertLessEqual(sl.visible_width(out), width - sl.EDGE, out)
+        return out
+
+    def full(self, **kw):
+        kw.setdefault("name", self.NAME)
+        kw.setdefault("marks", self.OK)
+        kw.setdefault("ports", ":3000")
+        kw.setdefault("venv", "venv:x")
+        return kw
+
+    def test_everything_fits_on_a_wide_window(self):
+        out = plain(self.line(300, **self.full()))
+        b = lambda p: plain(sl.bar(p))
+        self.assertEqual(out, f"claude-code-statusline › live-usage-and-redesign ~2 “{self.NAME}”"
+                              f" │ Opus 5.5 · high │ ctx 43% {b(43)} 430k/1M │ 5h 74% {b(74)} 2h10m"
+                              f" │ 7d 69% {b(69)} 5d14h │ $35.50 │ session 12m │ mcp 3 ✓ │ CC 2.1.296 ✓ │ plugins ✓"
+                              f" │ skills 69 │ venv:x │ :3000")
+
+    def test_no_extras_is_just_the_session_items(self):
+        out = plain(sl.format_statusline(self.DATA, self.usage(), NOW))
+        self.assertTrue(out.startswith("Opus 5.5 · high │ ctx 43% "), out)
+        self.assertNotIn("skills", out)
+
+    def test_unknown_usage_has_no_bar_and_no_countdown(self):
+        out = plain(sl.format_statusline(self.DATA, None, NOW))
+        self.assertIn("5h -- │ 7d -- │", out)
+
+    def test_countdown_follows_the_bar_in_light_grey(self):
+        raw = self.line(300)
+        self.assertIn(f"{sl.bar(74)} {sl.DIM}2h10m{sl.RST}", raw)
+        self.assertIn(f"{sl.bar(43)} {sl.DIM}430k/1M{sl.RST}", raw)
+
+    def test_percentages_keep_stage_colors_on_label_and_value(self):
+        raw = self.line(300)
+        for label, p in (("ctx", 43), ("5h", 74), ("7d", 69)):
+            c = sl.color_pct(p)
+            self.assertIn(f"{c}{label}{sl.RST} {c}{p}%{sl.RST} {sl.bar(p)}", raw)
+
+    def test_styles_of_model_cost_project_branch_and_name(self):
+        raw = self.line(300, name=self.NAME)
+        self.assertIn(f"{sl.model_color('claude-opus-5-5')}Opus 5.5", raw)
+        self.assertIn(f"{sl.EFFORT['high']}high", raw)
+        self.assertIn(f"{sl.COST}$35.50", raw)
+        self.assertTrue(raw.startswith(f"{sl.PROJECT}claude-code-statusline"), repr(raw[:40]))
+        self.assertIn(f"{sl.AMBER}live-usage-and-redesign", raw)  # dirty branch
+        self.assertIn(f"{sl.CYAN}“{self.NAME}”", raw)
+        self.assertIn(f"{sl.DIM}session 12m", raw)
+
+    def test_where_item_comes_first_then_the_name_then_the_model(self):
+        out = plain(self.line(300, name="my-task"))
+        self.assertTrue(out.startswith("claude-code-statusline › live-usage-and-redesign ~2 “my-task” │ Opus 5.5"), out)
+
+    def test_no_name_no_tag(self):
+        self.assertNotIn("“", plain(self.line(300)))
+        self.assertTrue(plain(self.line(300)).endswith("skills 69"))
+
+    def test_outside_a_repo_only_the_project_shows(self):
+        out = plain(self.line(300, git=None))
+        self.assertTrue(out.startswith("claude-code-statusline │ Opus"), out)
+
+    def test_ports_and_venv_only_when_detected(self):
+        out = plain(self.line(300, ports=":3000,5173", venv="venv:.venv"))
+        self.assertTrue(out.endswith("skills 69 │ venv:.venv │ :3000,5173"), out)
+        self.assertTrue(plain(self.line(300)).endswith("skills 69"))
+
+    def test_nerd_session_time_is_clock_and_number(self):
+        sl.set_icons("nerd")
+        out = plain(self.line(300))
+        self.assertIn(f"{sl.ICON['duration']} 12m", out)
+        self.assertNotIn("session", out)
+
+    def test_no_session_time_before_any_time_passed(self):
+        data = {**self.DATA, "cost": {"total_cost_usd": 35.5, "total_duration_ms": 0}}
+        self.assertNotIn("session", plain(sl.format_statusline(data, self.usage(), NOW)))
+
+    def test_nerd_icons_and_three_segment_bars(self):
+        sl.set_icons("nerd")
+        out = plain(self.line(300, name=self.NAME, marks=self.OK))
+        head = (f"{sl.ICON['project']} claude-code-statusline › {sl.ICON['branch']} live-usage-and-redesign ~2 "
+                f"{sl.ICON['tag']} {self.NAME} │ {sl.ICON['model']} Opus 5.5 · high")
+        self.assertTrue(out.startswith(head), out)
+        self.assertEqual(out.count(sl.ICON["segment"]), 9)
+        self.assertIn(f"{sl.ICON['skills']} skills 69", out)
+
+    def test_nerd_unknown_usage_has_no_bar(self):
+        sl.set_icons("nerd")
+        out = plain(sl.format_statusline(self.DATA, None, NOW))
+        self.assertEqual(out.count(sl.ICON["segment"]), 3)  # only ctx
+        self.assertIn(f"{sl.ICON['five_hour']} 5h --", out)
+
+    # --- the drop order ---------------------------------------------------------
+
+    def last_width(self, key, **kw):
+        """The narrowest window at which `key` is still on the line."""
+        kw = self.full(**kw)
+        found = [w for w in range(300, 20, -1) if key in plain(self.line(w, **kw))]
+        return found[-1] if found else None
+
+    def test_items_drop_in_the_documented_order(self):
+        keys = ["venv:x", "skills 69", "2h10m", "session 12m", "plugins ✓", "CC 2.1.296", "mcp 3",
+                "“", "live-usage", "claude-code", "430k/1M", "$35.50"]
+        widths = [self.last_width(k) for k in keys]
+        self.assertNotIn(None, widths)
+        self.assertEqual(self.last_width(":3000"), widths[0])
+        self.assertEqual(self.last_width("5d14h"), widths[2])
+        self.assertEqual(widths, sorted(widths, reverse=True), dict(zip(keys, widths)))
+        self.assertEqual(len(set(widths)), len(widths) - 0, dict(zip(keys, widths)))
+
+    def test_ports_and_venv_go_first(self):
+        n = sl.visible_width(plain(self.line(300, **self.full())))
+        got = plain(self.line(n + sl.EDGE - 1, **self.full()))
+        self.assertNotIn("venv:x", got)
+        self.assertNotIn(":3000", got)
+        self.assertIn("skills 69", got)
+        self.assertIn("2h10m", got)
+
+    def test_skills_go_second_and_countdowns_third(self):
+        kw = self.full(ports="", venv="")
+        n = sl.visible_width(plain(self.line(300, **kw)))
+        got = plain(self.line(n + sl.EDGE - 1, **kw))
+        self.assertNotIn("skills 69", got)
+        self.assertIn("2h10m", got)
+        kw = self.full(ports="", venv="", skills=None)
+        n = sl.visible_width(plain(self.line(300, **kw)))
+        got = plain(self.line(n + sl.EDGE - 1, **kw))
+        self.assertNotIn("2h10m", got)
+        self.assertNotIn("5d14h", got)
+        self.assertIn("session 12m", got)
+        self.assertIn("plugins ✓", got)
+        self.assertIn("430k/1M", got)
+
+    def test_healthy_marks_go_from_the_last_then_the_name(self):
+        kw = self.full(ports="", venv="", skills=None)
+        stages = []
+        for w in range(300, 20, -1):
+            out = plain(self.line(w, **kw))
+            state = tuple(k in out for k in ("session 12m", "plugins ✓", "CC 2.1.296", "mcp 3", "“"))
+            if not stages or stages[-1] != state:
+                stages.append(state)
+        self.assertEqual(stages[:6], [(True, True, True, True, True), (False, True, True, True, True),
+                                      (False, False, True, True, True), (False, False, False, True, True),
+                                      (False, False, False, False, True), (False, False, False, False, False)])
+
+    def test_branch_is_shortened_then_dropped_before_the_project_is_touched(self):
+        kw = self.full(ports="", venv="", skills=None, marks=[], name=None)
+        seen = []
+        for w in range(300, 20, -1):
+            out = plain(self.line(w, **kw))
+            first = out.split(" │ ")[0]
+            state = ("live-usage-and-redesign" in first, "live-usage…" in first, "live-" in first, "claude-code-statusline" in first)
+            if not seen or seen[-1] != state:
+                seen.append(state)
+        # full branch -> (mid-truncated by the soft cap) -> short branch -> no branch; the project stays whole
+        # until the branch is gone
+        short = [s for s in seen if s[1]]
+        self.assertTrue(short, seen)
+        gone = [s for s in seen if not s[2]]
+        self.assertTrue(gone, seen)
+        self.assertEqual(seen.index(short[0]) < seen.index(gone[0]), True)
+        self.assertTrue(short[0][3])
+
+    def test_project_is_truncated_to_14_before_it_goes(self):
+        kw = self.full(ports="", venv="", skills=None, marks=[], name=None, git=None)
+        firsts = [plain(self.line(w, **kw)).split(" │ ")[0] for w in range(300, 20, -1)]
+        self.assertEqual(firsts[0], "claude-code-statusline")
+        cut = [f for f in firsts if "…" in f]
+        self.assertTrue(cut, firsts)
+        self.assertEqual(min(len(f) for f in cut), 14)  # never below 14 before it goes
+        self.assertTrue(all(len(f) >= 14 for f in firsts if f.startswith("claude")))
+        self.assertTrue(any(f.startswith("Opus") for f in firsts))
+
+    def test_tokens_then_bars_then_cost_go_last_and_the_percentages_stay(self):
+        kw = self.full(ports="", venv="", skills=None, marks=[], name=None, git=None)
+        seen = []
+        for w in range(300, 20, -1):
+            out = plain(self.line(w, **kw))
+            for want in ("Opus 5.5", "ctx 43%", "5h 74%", "7d 69%"):
+                self.assertIn(want, out, w)
+            state = ("430k/1M" in out, out.count("█") // 5, "$35.50" in out)
+            if not seen or seen[-1] != state:
+                seen.append(state)
+        tokens_gone = next(i for i, s in enumerate(seen) if not s[0])
+        bars_gone = next(i for i, s in enumerate(seen) if s[1] == 0)
+        cost_gone = next(i for i, s in enumerate(seen) if not s[2])
+        self.assertLess(tokens_gone, bars_gone)
+        self.assertLess(bars_gone, cost_gone)
+
+    def test_bars_go_from_7d_then_5h_then_ctx(self):
+        kw = self.full(ports="", venv="", skills=None, marks=[], name=None, git=None)
+        seen = []
+        for w in range(300, 20, -1):
+            out = plain(self.line(w, **kw))
+            state = tuple(bool(re.search(rf"{label} \d+% █", out)) for label in ("ctx", "5h", "7d"))
+            if not seen or seen[-1] != state:
+                seen.append(state)
+        self.assertEqual(seen, [(True, True, True), (True, True, False), (True, False, False), (False, False, False)])
+
+    def test_problems_are_named_while_there_is_room(self):
+        out = plain(self.line(300, **self.full(marks=self.BAD)))
+        self.assertIn("▲ Gmail failed │ ↑ 2.2 available │ ~ reload", out)
+        self.assertNotIn("mcp 3", out)
+
+    def test_problems_outlast_countdowns_and_session_time(self):
+        kw = self.full(ports="", venv="", skills=None, marks=self.BAD)
+        n = sl.visible_width(plain(self.line(300, **kw)))
+        got = plain(self.line(n + sl.EDGE - 1, **kw))
+        self.assertNotIn("2h10m", got)
+        self.assertIn("▲ Gmail failed │ ↑ 2.2 available │ ~ reload", got)
+
+    def test_warning_texts_go_from_the_last_then_a_bare_marker_takes_over(self):
+        kw = self.full(ports="", venv="", skills=None, marks=self.BAD, git=None, name=None)
+        warn = sl.ICON["warn"]
+        seen = []
+        for w in range(300, 50, -1):
+            out = plain(self.line(w, **kw))
+            state = ("▲ Gmail failed" in out, "↑ 2.2 available" in out, "~ reload" in out,
+                     out.endswith(warn), "$35.50" in out, "█" in out, "430k/1M" in out)
+            if not seen or seen[-1] != state:
+                seen.append(state)
+        flags = [s[:3] for s in seen]
+        self.assertIn((True, True, True), flags)
+        self.assertIn((True, True, False), flags)
+        self.assertIn((True, False, False), flags)
+        self.assertIn((False, False, False), flags)
+        marker_states = [s for s in seen if s[3]]
+        self.assertTrue(marker_states)
+        self.assertFalse(any(s[0] or s[1] or s[2] for s in marker_states))
+        # the bare marker outlasts the tokens, the bars and the cost
+        self.assertTrue(any(s[3] and s[4] and s[5] and s[6] for s in seen))
+        self.assertTrue(any(s[3] and not s[4] and not s[5] and not s[6] for s in seen), seen)
+
+    def test_bare_marker_stays_down_to_model_and_percentages(self):
+        kw = self.full(ports="", venv="", skills=None, marks=self.BAD, git=None, name=None)
+        small = plain(self.line(52, **kw))
+        self.assertTrue(small.endswith(sl.ICON["warn"]), small)
+        self.assertNotIn("$35.50", small)
+        for want in ("Opus 5.5", "ctx 43%", "5h 74%", "7d 69%"):
+            self.assertIn(want, small)
+
+    def test_marker_is_red_for_a_failed_server_and_amber_for_the_rest(self):
+        kw = self.full(ports="", venv="", skills=None, git=None, name=None)
+        raw = self.line(52, **{**kw, "marks": self.BAD})
+        self.assertTrue(raw.endswith(f"{sl.RED}{sl.ICON['warn']}{sl.RST}"), repr(raw[-30:]))
+        raw = self.line(52, **{**kw, "marks": self.BAD[1:]})
+        self.assertTrue(raw.endswith(f"{sl.AMBER}{sl.ICON['warn']}{sl.RST}"), repr(raw[-30:]))
+        ok = plain(self.line(52, **{**kw, "marks": self.OK}))
+        self.assertNotIn(sl.ICON["warn"], ok)
+
+    def test_never_more_than_one_line_even_when_tiny(self):
+        for w in (24, 30, 40):
+            out = plain(self.line(w, **self.full(marks=self.BAD)))
+            self.assertNotIn("\n", out)
+            for want in ("Opus 5.5", "ctx 43%", "5h 74%", "7d 69%"):
+                self.assertIn(want, out)
+
+    def test_names_get_about_a_third_of_the_line_before_anything_else_goes(self):
+        out = self.at(120, **self.full(marks=[], ports="", venv="", skills=None, name=None))
+        first = out.split(" │ ")[0]
+        self.assertLessEqual(len(first), 0.4 * 116)
+        self.assertIn("…", first)
+
+    def test_every_width_fits(self):
+        # 47 columns is the least that holds the model and the three percentages
+        for marks in ([], self.OK, self.BAD):
+            for w in range(52, 260, 3):
+                self.at(w, **self.full(marks=marks))
+
+    def test_nerd_line_fits_a_120_column_window(self):
+        sl.set_icons("nerd")
+        out = self.at(120, **self.full(marks=self.OK))
+        for want in ("Opus 5.5", "ctx 43%", "5h 74%", "7d 69%", "35.50"):
+            self.assertIn(want, out)
+        self.assertEqual(out.count(sl.ICON["segment"]), 9)
+
+    def test_width_none_means_no_limit(self):
+        self.assertIn("venv:x", plain(self.line(None, **self.full())))
+
+
+class SessionName(unittest.TestCase):
+    """The session name: payload session_name, else the newest title in the transcript's tail."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = pathlib.Path(self.tmp.name) / "t.jsonl"
+
+    def write(self, *entries):
+        import json
+        lines = [json.dumps(e) for e in entries]
+        self.path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+
+    def test_slug_is_lowercase_and_hyphenated(self):
+        self.assertEqual(sl.slugify("Statusline.py: usage  accuracy!"), "statusline-py-usage-accuracy")
+        self.assertEqual(sl.slugify("  --Fix the bug--  "), "fix-the-bug")
+        self.assertEqual(sl.slugify("!!!"), "")
+        self.assertEqual(sl.slugify("דוגמה בדיקה"), "דוגמה-בדיקה")
+
+    def test_slug_is_capped_at_a_word_boundary(self):
+        got = sl.slugify("rebuild the statusline layout as one single upgraded line")
+        self.assertEqual(got, "rebuild-the-statusline")
+        self.assertLessEqual(len(got), sl.NAME_MAX)
+        self.assertEqual(sl.slugify("x" * 40), "x" * sl.NAME_MAX)  # one huge word is cut hard
+        self.assertEqual(sl.NAME_MAX, 28)
+
+    def test_payload_session_name_wins(self):
+        self.write({"type": "ai-title", "aiTitle": "From The Transcript"})
+        data = {"session_name": "My Renamed Session", "transcript_path": str(self.path)}
+        self.assertEqual(sl.session_name(data), "my-renamed-session")
+
+    def test_blank_payload_name_falls_back_to_the_transcript(self):
+        self.write({"type": "ai-title", "aiTitle": "From The Transcript"})
+        data = {"session_name": "  ", "transcript_path": str(self.path)}
+        self.assertEqual(sl.session_name(data), "from-the-transcript")
+
+    def test_newest_title_entry_wins_whatever_its_kind(self):
+        self.write({"type": "ai-title", "aiTitle": "First"}, {"type": "user"},
+                   {"type": "agent-name", "agentName": "Second"},
+                   {"type": "custom-title", "customTitle": "Third"},
+                   {"type": "ai-title", "aiTitle": "Fourth One"}, {"type": "assistant"})
+        self.assertEqual(sl.tail_title(self.path), "Fourth One")
+        self.write({"type": "ai-title", "aiTitle": "Old"}, {"type": "agent-name", "agentName": "Newer"})
+        self.assertEqual(sl.tail_title(self.path), "Newer")
+        self.write({"type": "custom-title", "customTitle": "Mine"})
+        self.assertEqual(sl.tail_title(self.path), "Mine")
+
+    def test_no_title_no_name(self):
+        self.write({"type": "user"}, {"type": "assistant"})
+        self.assertEqual(sl.session_name({"transcript_path": str(self.path)}), "")
+        self.assertEqual(sl.session_name({"transcript_path": str(self.path) + ".missing"}), "")
+        self.assertEqual(sl.session_name({}), "")
+
+    def test_only_the_tail_of_a_huge_transcript_is_read(self):
+        self.write({"type": "ai-title", "aiTitle": "Buried Title"})
+        filler = b'{"type":"assistant","text":"' + b"x" * 1000 + b'"}\n'
+        with open(self.path, "ab") as f:
+            f.write(filler * 600)  # ~600 KB after the title
+        self.assertEqual(sl.tail_title(self.path), "")  # out of the 256 KB window
+        with open(self.path, "ab") as f:
+            f.write(b'{"type":"ai-title","aiTitle":"Fresh Title"}\n' + filler * 10)
+        self.assertEqual(sl.tail_title(self.path), "Fresh Title")
+
+    def test_the_read_is_bounded(self):
+        from unittest import mock
+        self.write({"type": "ai-title", "aiTitle": "T"})
+        with open(self.path, "ab") as f:
+            f.write(b"x" * 1_000_000)
+        sizes = []
+        real_open = open
+
+        def spy(file, mode="r", *a, **k):
+            f = real_open(file, mode, *a, **k)
+            real_read = f.read
+
+            def read(n=-1):
+                data = real_read(n)
+                sizes.append(len(data))
+                return data
+            f.read = read
+            return f
+
+        with mock.patch("builtins.open", spy):
+            sl.tail_title(self.path)
+        self.assertTrue(sizes and max(sizes) <= 262_144, sizes)
+
+    def test_a_title_cut_in_half_by_a_partial_last_line_is_ignored(self):
+        self.write({"type": "ai-title", "aiTitle": "Whole"})
+        with open(self.path, "ab") as f:
+            f.write(b'{"type":"ai-title","aiTitle":"Cut ')
+        self.assertEqual(sl.tail_title(self.path), "Whole")
+
+    def test_cached_by_path_and_size(self):
+        from unittest import mock
+        self.write({"type": "ai-title", "aiTitle": "First Name"})
+        data = {"transcript_path": str(self.path)}
+        cache_file = pathlib.Path(self.tmp.name) / "probe.json"
+        with mock.patch.object(sl, "tail_title", wraps=sl.tail_title) as tail:
+            c = sl.ProbeCache(cache_file, NOW)
+            self.assertEqual(sl.session_name(data, c), "first-name")
+            c.save()
+            c = sl.ProbeCache(cache_file, NOW + 1)
+            self.assertEqual(sl.session_name(data, c), "first-name")
+            self.assertEqual(tail.call_count, 1)  # same size: not read again
+            with open(self.path, "ab") as f:
+                f.write(b'{"type":"ai-title","aiTitle":"Second Name"}\n')
+            self.assertEqual(sl.session_name(data, c), "second-name")
+            self.assertEqual(tail.call_count, 2)
+
+    def test_a_name_stays_when_the_grown_tail_has_no_title(self):
+        self.write({"type": "ai-title", "aiTitle": "Kept Name"})
+        data = {"transcript_path": str(self.path)}
+        c = sl.ProbeCache(None, NOW)
+        self.assertEqual(sl.session_name(data, c), "kept-name")
+        with open(self.path, "ab") as f:
+            f.write(b'{"type":"assistant"}\n' * 20_000)
+        self.assertEqual(sl.session_name(data, c), "kept-name")
+
+    def test_the_cached_entry_is_kept_fresh_while_the_file_does_not_change(self):
+        cache_file = pathlib.Path(self.tmp.name) / "probe.json"
+        self.write({"type": "ai-title", "aiTitle": "Old Session"})
+        data = {"transcript_path": str(self.path)}
+        c = sl.ProbeCache(cache_file, NOW)
+        sl.session_name(data, c)
+        c.save()
+        later = NOW + sl.NAME_REFRESH + 5
+        c = sl.ProbeCache(cache_file, later)
+        sl.session_name(data, c)
+        c.save()
+        c = sl.ProbeCache(cache_file, later + 40)  # more than the longest probe TTL after the first write
+        self.assertEqual(c.peek("name:" + str(self.path)).get("name"), "old-session")
+
+    def test_a_garbage_cache_entry_is_just_reread(self):
+        import json
+        self.write({"type": "ai-title", "aiTitle": "Name Here"})
+        cache_file = pathlib.Path(self.tmp.name) / "probe.json"
+        key = "name:" + str(self.path)
+        cache_file.write_text(json.dumps({key: {"at": NOW, "v": "junk"}}), encoding="utf-8")
+        c = sl.ProbeCache(cache_file, NOW)
+        self.assertEqual(sl.session_name({"transcript_path": str(self.path)}, c), "name-here")
+
+
+class TempClaudeDir:
+    """Runs main() against a temp CLAUDE_DIR and a temp project folder."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.tmp.name)
+        self.dir = root / "claude"
+        self.dir.mkdir()
+        self.proj = root / "my-special-proj"
+        self.proj.mkdir()
+        self.saved = {k: getattr(sl, k) for k in ("CLAUDE_DIR", "USAGE_CACHE", "USAGE_LOCK", "NATIVE_VERSIONS")}
+        sl.CLAUDE_DIR = self.dir
+        sl.USAGE_CACHE = self.dir / "statusline-usage.json"
+        sl.USAGE_LOCK = self.dir / "statusline-usage.lock"
+        sl.NATIVE_VERSIONS = root / "versions"
+        from unittest import mock
+        for name, value in (("run", ""), ("open_ports", [])):  # no real git or port scan
+            patcher = mock.patch.object(sl, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ)  # a venv of the developer running the tests must not show up
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ("VIRTUAL_ENV", "CONDA_DEFAULT_ENV"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(sl, k, v)
+        sl.set_icons("none")
+        self.tmp.cleanup()
+
+    def render(self, icons="none", columns=120, health=None, data_update=None,
+               live_usage=False, drop=()):
+        """main() against the temp folders; setUp made git say 'not a repo' and no port answer."""
+        import io, json, os
+        from contextlib import ExitStack, redirect_stdout
+        from unittest import mock
+        data = dict(SingleLine.DATA)
+        data["rate_limits"] = {"five_hour": {"used_percentage": 19, "resets_at": 9e9},
+                               "seven_day": {"used_percentage": 55, "resets_at": 9e9}}
+        data["workspace"] = {"current_dir": str(self.proj)}
+        data.update(data_update or {})
+        for k in drop:
+            data.pop(k, None)
+        buf = io.StringIO()
+        with ExitStack() as stack:
+            if health is not None:
+                stack.enter_context(mock.patch.object(sl, "health_state", return_value=health))
+            stack.enter_context(mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))))
+            stack.enter_context(mock.patch.object(sys, "argv", ["statusline.py", "--icons", icons]))
+            stack.enter_context(mock.patch.dict(os.environ, {"COLUMNS": str(columns), "STATUSLINE_LIVE_USAGE": "1" if live_usage else "0", "WT_SESSION": "test"}))
+            stack.enter_context(redirect_stdout(buf))
+            with self.assertRaises(SystemExit):
+                sl.main()
+        return buf.getvalue().rstrip("\n")
+
+
+class MainRendering(TempClaudeDir, unittest.TestCase):
+    """main() renders the one line in a temp CLAUDE_DIR."""
+
+    DISCORD = ("2.1.296", ("ok", None), [], (["a"], ["discord"]), None)
+    THREE_PROBLEMS = ("2.1.296", ("restart", "2.1.300"), ["p1"], (["a"], ["discord"]), None)
+    HEALTHY = ("2.1.296", ("ok", None), [], (["a", "b", "c"], []), 69)
+
+    def test_one_line_with_project_and_every_reading(self):
+        raw = self.render(health=self.HEALTHY, columns=200)
+        out = plain(raw)
+        self.assertNotIn("\n", out)
+        self.assertTrue(out.startswith("my-special-proj │ Opus 5.5 · high │ ctx 43% "), out)
+        for want in ("5h 19%", "7d 55%", "$35.50", "session 12m", "mcp 3 ✓", "CC 2.1.296 ✓", "plugins ✓",
+                     "skills 69"):
+            self.assertIn(want, out)
+        self.assertIn(sl.SEP, raw)
+
+    def test_the_mode_file_is_gone(self):
+        for text in ("full", "compact", "bananas"):
+            (self.dir / "statusline-mode").write_text(text, encoding="utf-8")
+            self.assertEqual(plain(self.render(health=self.HEALTHY)).count("\n"), 0)
+        for name in ("read_mode", "MODE_FILE_NAME", "TOGGLE_KEY", "format_compact", "compact_hint",
+                     "toggle_hint", "workspace_line", "flow", "format_health", "compact_problems"):
+            self.assertFalse(hasattr(sl, name), name)
+
+    def test_plain_120_with_a_failed_server_keeps_the_bars_and_a_warning(self):
+        out = plain(self.render(health=self.DISCORD))
+        self.assertEqual(out.count("█") // 5, 3)
+        self.assertIn(sl.PLAIN_ICONS["warn"], out)
+        self.assertLessEqual(sl.visible_width(out), 120 - sl.EDGE)
+
+    def test_nerd_120_has_three_three_segment_bars_and_fits(self):
+        out = plain(self.render(icons="nerd", health=self.HEALTHY))
+        self.assertNotIn("\n", out)
+        self.assertEqual(out.count(sl.NERD_ICONS["segment"]), 9)
+        self.assertLessEqual(sl.visible_width(out), 120 - sl.EDGE)
+        for want in ("my-special-proj", "Opus 5.5", "ctx 43%", "5h 19%", "7d 55%", "35.50"):
+            self.assertIn(want, out)
+
+    def test_a_failed_server_is_named_on_a_wide_window_and_red_marker_on_a_narrow_one(self):
+        wide = plain(self.render(icons="nerd", columns=200, health=self.DISCORD))
+        self.assertIn(f"{sl.NERD_ICONS['warn']} discord failed", wide)
+        raw = self.render(icons="nerd", columns=70, health=self.DISCORD)
+        self.assertNotIn("discord", raw)
+        self.assertIn(f"{sl.RED}{sl.NERD_ICONS['warn']}{sl.RST}", raw)
+        ok = self.render(icons="nerd", columns=70, health=self.HEALTHY)
+        self.assertNotIn(sl.NERD_ICONS["warn"], ok)
+
+    def test_absent_rate_limits_show_unknown_windows(self):
+        for health in (None, self.DISCORD):
+            out = plain(self.render(health=health, drop=("rate_limits",)))
+            self.assertRegex(out, r"5h\s+--")
+            self.assertRegex(out, r"7d\s+--")
+
+    def test_absent_context_window_shows_ctx_unknown(self):
+        out = plain(self.render(drop=("context_window",)))
+        self.assertRegex(out, r"ctx\s+--")
+        self.assertNotIn("430k", out)
+
+    def test_60_columns_is_one_line_with_every_reading(self):
+        out = plain(self.render(columns=60, health=self.DISCORD))
+        self.assertNotIn("\n", out)
+        for want in ("ctx 43%", "5h 19%", "7d 55%"):
+            self.assertIn(want, out)
+        self.assertLessEqual(sl.visible_width(out), 60 - sl.EDGE)
+
+    def test_three_problems_fit_one_line(self):
+        out = plain(self.render(health=self.THREE_PROBLEMS))
+        self.assertNotIn("\n", out)
+        self.assertLessEqual(sl.visible_width(out), 120 - sl.EDGE)
+
+    def test_unknown_width_shows_everything(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}):
+            out = plain(self.render(columns="", health=self.HEALTHY))
+        self.assertIn("skills 69", out)
+
+    def test_the_session_name_comes_from_the_transcript_tail(self):
+        transcript = self.dir / "t.jsonl"
+        transcript.write_text('{"type":"ai-title","aiTitle":"Statusline py usage accuracy"}\n', encoding="utf-8")
+        out = plain(self.render(columns=200, health=self.HEALTHY, data_update={"transcript_path": str(transcript)}))
+        self.assertIn("“statusline-py-usage-accuracy”", out)
+        self.assertTrue(out.startswith("my-special-proj “statusline-py-usage-accuracy” │ Opus"), out)
+
+    def test_a_payload_session_name_is_used_and_no_name_no_tag(self):
+        out = plain(self.render(columns=200, health=self.HEALTHY, data_update={"session_name": "My Task"}))
+        self.assertIn("“my-task”", out)
+        self.assertNotIn("“", plain(self.render(columns=200, health=self.HEALTHY)))
+
+    def test_dev_ports_and_venv_show_only_when_found(self):
+        from unittest import mock
+        self.assertTrue(plain(self.render(columns=300, health=self.HEALTHY)).endswith("skills 69"))
+        (self.dir / sl.PROBE_CACHE_NAME).unlink()  # the port scan is cached for PORTS_TTL
+        with mock.patch.object(sl, "open_ports", return_value=[3000, 5173]), \
+                mock.patch.dict(os.environ, {"VIRTUAL_ENV": "/x/.venv"}):
+            out = plain(self.render(columns=300, health=self.HEALTHY))
+        self.assertTrue(out.endswith("skills 69 │ venv:.venv │ :3000,5173"), out)
+
+    def test_a_git_repo_shows_branch_and_dirty_count_after_the_project(self):
+        from unittest import mock
+        with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN):
+            out = plain(self.render(columns=200, health=self.HEALTHY))
+        self.assertTrue(out.startswith("my-special-proj › main ~1 ?1 │ Opus"), out)
+
+    def test_a_broken_probe_never_blanks_the_line(self):
+        from unittest import mock
+        with mock.patch.object(sl, "health_state", side_effect=RuntimeError("x")), \
+                mock.patch.object(sl, "session_name", side_effect=RuntimeError("x")):
+            out = plain(self.render(columns=200))
+        self.assertIn("ctx 43%", out)
+        self.assertNotIn("Claude | --", out)
+
+
+class IconFallback(unittest.TestCase):
+    """The classic Windows console (conhost) draws no Nerd Font glyphs: it gets plain icons."""
+
+    def classes(self, console_class, wt=False, term=None):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k not in ("WT_SESSION", "TERM_PROGRAM")}
+        env.update({"WT_SESSION": "x"} if wt else {})
+        env.update({"TERM_PROGRAM": term} if term else {})
+        stack = mock.patch.dict(os.environ, env, clear=True)
+        stack.__enter__()
+        self.addCleanup(stack.__exit__, None, None, None)
+        p = mock.patch.object(sl, "console_window_class", return_value=console_class)
+        p.start()
+        self.addCleanup(p.stop)
+        return sl.effective_icons("nerd")
+
+    def test_classic_console_gets_plain_icons(self):
+        self.assertEqual(self.classes("ConsoleWindowClass"), "none")
+
+    def test_windows_terminal_keeps_nerd_icons(self):
+        self.assertEqual(self.classes("PseudoConsoleWindow", wt=True), "nerd")
+
+    def test_no_console_window_with_windows_terminal_env_keeps_nerd_icons(self):
+        self.assertEqual(self.classes("", wt=True), "nerd")
+
+    def test_no_console_window_and_no_terminal_hint_gets_plain_icons(self):
+        self.assertEqual(self.classes(""), "none")
+
+    def test_other_terminals_keep_nerd_icons(self):
+        self.assertEqual(self.classes("", term="vscode"), "nerd")
+        self.assertEqual(self.classes(None), "nerd")  # not Windows / unknown
+
+    def test_plain_request_is_never_upgraded(self):
+        self.assertEqual(self.classes("PseudoConsoleWindow", wt=True) and sl.effective_icons("none"), "none")
+
+    def test_force_variable_wins(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"STATUSLINE_FORCE_ICONS": "1"}), \
+                mock.patch.object(sl, "console_window_class", return_value="ConsoleWindowClass"):
+            self.assertEqual(sl.effective_icons("nerd"), "nerd")
+
+    def test_plain_glyphs_are_ones_consolas_and_cascadia_have(self):
+        self.assertEqual(sorted(sl.PLAIN_ICONS), ["ok", "reload", "up", "warn"])
+        self.assertNotIn(sl.PLAIN_ICONS["reload"], "↻")
+
+
+GIT_PORCELAIN = ("# branch.oid 0123456789abcdef\n# branch.head main\n"
+                 "1 .M N... 100644 100644 100644 a b file.py\n? new.txt\n")
+
+
+class ProbeCache(unittest.TestCase):
+    """Slow probes (git, ports, health) are kept in CLAUDE_DIR/statusline-probe-cache.json for a few seconds."""
+
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.path = self.dir / sl.PROBE_CACHE_NAME
+        self.repo = self.dir / "repo"
+        self.repo.mkdir()
+        for name, value in (("CLAUDE_DIR", self.dir), ("USAGE_CACHE", self.dir / "usage.json"),
+                            ("NATIVE_VERSIONS", self.dir / "versions")):
+            patcher = mock.patch.object(sl, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def at(self, now, probe):
+        """Run probe(cache) as one render would at time `now`: load the cache, probe, save."""
+        cache = sl.ProbeCache(self.path, now)
+        value = probe(cache)
+        cache.save()
+        return value
+
+    def git(self, now, cwd=None):
+        return self.at(now, lambda c: sl.git_info(str(cwd or self.repo), c))
+
+    def test_git_within_ttl_is_not_run_again(self):
+        from unittest import mock
+        with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN) as run:
+            first = self.git(NOW)
+            second = self.git(NOW + sl.GIT_TTL - 0.5)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(sl.where_item("p", second), sl.where_item("p", first))
+        self.assertEqual(plain(sl.where_item("p", second)), "p › main ~1 ?1")
+
+    def test_expired_git_entry_refreshes(self):
+        from unittest import mock
+        with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN) as run:
+            self.git(NOW)
+            run.return_value = "# branch.oid 0123456789abcdef\n# branch.head other\n"
+            later = self.git(NOW + sl.GIT_TTL + 0.1)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(plain(sl.where_item("p", later)), "p › other")
+
+    def test_git_is_cached_per_directory(self):
+        from unittest import mock
+        other = self.dir / "other"
+        other.mkdir()
+        with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN) as run:
+            self.git(NOW)
+            self.git(NOW + 1, cwd=other)
+            self.git(NOW + 2)
+        self.assertEqual(run.call_count, 2)
+
+    def test_ports_within_ttl_are_not_probed_again(self):
+        from unittest import mock
+        with mock.patch.object(sl, "open_ports", return_value=[3000, 8080]) as probe:
+            first = self.at(NOW, sl.ports_tag)
+            second = self.at(NOW + sl.PORTS_TTL - 0.5, sl.ports_tag)
+            self.assertEqual(probe.call_count, 1)
+            self.at(NOW + sl.PORTS_TTL + 0.1, sl.ports_tag)
+            self.assertEqual(probe.call_count, 2)
+        self.assertEqual(second, first)
+        self.assertEqual(plain(first), ":3000,8080")
+
+    def health(self, now, session="s1", project="proj"):
+        data = {"session_id": session, "version": "2.1.296",
+                "workspace": {"project_dir": str(self.dir / project)}}
+        return self.at(now, lambda c: sl.health_state(data, cache=c))
+
+    def test_health_is_cached_per_session_and_project(self):
+        from unittest import mock
+        logs = {"plugin-x-x": [{"debug": "Successfully connected", "sessionId": "s1"}]}
+        with mock.patch.object(sl, "read_mcp_logs", return_value=logs) as read, \
+                mock.patch.object(sl, "count_skills", return_value=7):
+            first = self.health(NOW)
+            second = self.health(NOW + sl.HEALTH_TTL - 0.5)
+            self.assertEqual(read.call_count, 1)
+            self.health(NOW + 1, session="s2")
+            self.health(NOW + 1, project="elsewhere")
+            self.assertEqual(read.call_count, 3)
+            self.health(NOW + sl.HEALTH_TTL + 0.1)
+            self.assertEqual(read.call_count, 4)
+        self.assertEqual(sl.health_marks(*second[:4]), sl.health_marks(*first[:4]))  # JSON turns tuples to lists
+        self.assertEqual([plain(t) for t, _ in sl.health_marks(*first[:4])], ["mcp 1 ✓", "CC 2.1.296"])
+        self.assertEqual(first[4], 7)
+
+    def test_skill_count_lives_longer_than_the_rest_of_health(self):
+        from unittest import mock
+        with mock.patch.object(sl, "read_mcp_logs", return_value=None), \
+                mock.patch.object(sl, "count_skills", return_value=7) as count:
+            self.health(NOW)
+            self.health(NOW + sl.HEALTH_TTL + 1)
+            self.assertEqual(count.call_count, 1)
+            self.health(NOW + sl.SKILLS_TTL + 0.1)
+            self.assertEqual(count.call_count, 2)
+
+    def test_corrupt_cache_file_is_ignored(self):
+        import json
+        from unittest import mock
+        for garbage in (b"\x00\xff not json", b"[1, 2]", b"null", b'{"git": "x"}'):
+            self.path.write_bytes(garbage)
+            with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN) as run:
+                got = self.git(NOW)
+            self.assertEqual(run.call_count, 1, garbage)
+            self.assertEqual(plain(sl.where_item("p", got)), "p › main ~1 ?1")
+            self.assertIsInstance(json.loads(self.path.read_text(encoding="utf-8")), dict)
+
+    def test_malformed_entries_are_recomputed(self):
+        import json
+        from unittest import mock
+        with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN) as run:
+            self.git(NOW)
+            for bad in (5, None, {"at": "soon", "v": ["x"]}, {"at": NOW}, {"v": ["main", 0, 0, 0]},
+                        {"at": NOW + 100, "v": ["future", 0, 0, 0]}):
+                entries = json.loads(self.path.read_text(encoding="utf-8"))
+                self.path.write_text(json.dumps({k: bad for k in entries}), encoding="utf-8")
+                got = self.git(NOW + 1)
+                self.assertEqual(plain(sl.where_item("p", got)), "p › main ~1 ?1", bad)
+        self.assertEqual(run.call_count, 7)
+
+    def test_unwritable_cache_never_breaks_rendering(self):
+        from unittest import mock
+        self.path.mkdir()  # a folder where the file should be: reads and writes both fail
+        with mock.patch.object(sl, "run", return_value=GIT_PORCELAIN) as run:
+            self.assertEqual(plain(sl.where_item("p", self.git(NOW))), "p › main ~1 ?1")
+            self.git(NOW + 1)
+        self.assertEqual(run.call_count, 2)
+
+    def entries(self):
+        import json
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def test_concurrent_sessions_keep_each_others_entries(self):
+        # Both sessions loaded the file before either saved: the second save must merge, not overwrite.
+        a, b = sl.ProbeCache(self.path, NOW), sl.ProbeCache(self.path, NOW + 0.3)
+        a.get("only-a", 10, lambda: ["a"])
+        b.get("only-b", 10, lambda: ["b"])
+        a.save()
+        b.save()
+        got = self.entries()
+        self.assertEqual({k: e["v"] for k, e in got.items()}, {"only-a": ["a"], "only-b": ["b"]})
+
+    def test_two_threads_saving_different_keys_both_survive(self):
+        import threading
+        caches = [sl.ProbeCache(self.path, NOW), sl.ProbeCache(self.path, NOW)]
+        loaded = threading.Barrier(2)
+
+        def writer(cache, key):
+            cache.get(key, 10, lambda: [key])
+            loaded.wait()
+            cache.save()
+
+        threads = [threading.Thread(target=writer, args=(c, k)) for c, k in zip(caches, ("k1", "k2"))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(set(self.entries()), {"k1", "k2"})
+
+    def test_newest_entry_per_key_wins_whoever_saves_last(self):
+        older, newer = sl.ProbeCache(self.path, NOW), sl.ProbeCache(self.path, NOW + 1)
+        older.get("k", 10, lambda: ["old"])
+        newer.get("k", 10, lambda: ["new"])
+        newer.save()
+        older.save()
+        self.assertEqual(self.entries()["k"]["v"], ["new"])
+
+    def test_entries_from_a_session_a_moment_ahead_are_kept_and_used(self):
+        ahead = sl.ProbeCache(self.path, NOW + 0.5)
+        ahead.get("k", 10, lambda: ["v"])
+        ahead.save()
+        behind = sl.ProbeCache(self.path, NOW)
+        self.assertEqual(behind.get("k", 10, lambda: self.fail("recomputed")), ["v"])
+        behind.get("other", 10, lambda: ["o"])
+        behind.save()
+        self.assertIn("k", self.entries())
+
+    def test_save_retries_a_sharing_violation(self):
+        from unittest import mock
+        real = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError("in use")
+            return real(src, dst)
+
+        cache = sl.ProbeCache(self.path, NOW)
+        cache.get("k", 10, lambda: ["v"])
+        with mock.patch.object(sl.os, "replace", flaky):
+            cache.save()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.entries()["k"]["v"], ["v"])
+        self.assertEqual([p.name for p in self.dir.glob("*.tmp")], [])
+
+    def test_only_one_session_recomputes_an_expired_key(self):
+        seed =sl.ProbeCache(self.path, NOW)
+        seed.get("k", 10, lambda: ["stale"])
+        seed.save()
+        first, second = sl.ProbeCache(self.path, NOW + 20), sl.ProbeCache(self.path, NOW + 20)
+        seen = {}
+
+        def slow_compute():
+            # While the first session is computing, the second one renders.
+            seen["second"] = second.get("k", 10, lambda: self.fail("second session recomputed"))
+            return ["fresh"]
+
+        self.assertEqual(first.get("k", 10, slow_compute), ["fresh"])
+        self.assertEqual(seen["second"], ["stale"])
+
+    def test_a_dead_claim_does_not_block_recomputing(self):
+        seed = sl.ProbeCache(self.path, NOW)
+        seed.get("k", 10, lambda: ["stale"])
+        seed.save()
+        cache = sl.ProbeCache(self.path, NOW + 20)
+        cache.get("k", 10, lambda: ["x"])  # leaves nothing behind once done
+        claims = list(self.dir.glob("*.claim"))
+        self.assertEqual(claims, [])
+        claim = pathlib.Path(f"{self.path}.{sl.zlib.crc32(b'k'):08x}.claim")
+        claim.write_bytes(b"")
+        os.utime(claim, (time.time() - 60, time.time() - 60))  # a session that died mid-probe
+        again = sl.ProbeCache(self.path, NOW + 40)
+        self.assertEqual(again.get("k", 10, lambda: ["fresh"]), ["fresh"])
+
+    def test_a_missing_key_is_computed_even_if_claimed(self):
+        claim = pathlib.Path(f"{self.path}.{sl.zlib.crc32(b'k'):08x}.claim")
+        claim.write_bytes(b"")
+        self.assertEqual(sl.ProbeCache(self.path, NOW).get("k", 10, lambda: ["v"]), ["v"])
+
+
+class CachedRendering(TempClaudeDir, unittest.TestCase):
+    """Whole renders through main(): probes come from the cache, everything else is live."""
+
+    def probes(self):
+        from contextlib import ExitStack
+        from unittest import mock
+        stack = ExitStack()
+        mocks = {name: stack.enter_context(mock.patch.object(sl, name, return_value=value))
+                 for name, value in (("run", GIT_PORCELAIN), ("open_ports", [5173]), ("read_mcp_logs", None))}
+        return stack, mocks
+
+    WIDE = 300
+
+    def test_second_render_within_ttl_does_not_probe_again(self):
+        stack, m = self.probes()
+        with stack:
+            first = self.render(columns=self.WIDE)
+            second = self.render(columns=self.WIDE)
+        self.assertEqual(second, first)
+        self.assertIn("main ~1 ?1", plain(first))
+        self.assertIn(":5173", plain(first))
+        self.assertEqual([m[k].call_count for k in ("run", "open_ports", "read_mcp_logs")], [1, 1, 1])
+        self.assertTrue((self.dir / sl.PROBE_CACHE_NAME).exists())
+
+    def test_the_session_name_is_not_read_again_until_the_transcript_grows(self):
+        from unittest import mock
+        transcript = self.dir / "t.jsonl"
+        transcript.write_text('{"type":"ai-title","aiTitle":"First name"}\n', encoding="utf-8")
+        update = {"transcript_path": str(transcript)}
+        stack, _ = self.probes()
+        with stack, mock.patch.object(sl, "tail_title", wraps=sl.tail_title) as tail:
+            first = plain(self.render(columns=self.WIDE, data_update=update))
+            self.render(columns=self.WIDE, data_update=update)
+            self.assertEqual(tail.call_count, 1)
+            with open(transcript, "a", encoding="utf-8") as f:
+                f.write('{"type":"ai-title","aiTitle":"Second name"}\n')
+            second = plain(self.render(columns=self.WIDE, data_update=update))
+            self.assertEqual(tail.call_count, 2)
+        self.assertIn("“first-name”", first)
+        self.assertIn("“second-name”", second)
+
+    def test_live_numbers_are_never_cached(self):
+        stack, _ = self.probes()
+        with stack:
+            self.render(columns=self.WIDE)
+            out = plain(self.render(columns=self.WIDE, data_update={
+                "context_window": {"used_percentage": 77},
+                "cost": {"total_cost_usd": 99.25, "total_duration_ms": 120_000}}))
+        self.assertIn("ctx 77%", out)
+        self.assertIn("$99.25", out)
+        self.assertIn("session 2m", out)
+
+    def test_corrupt_cache_file_still_renders(self):
+        import json
+        (self.dir / sl.PROBE_CACHE_NAME).write_bytes(b"{\"half\": [")
+        stack, _ = self.probes()
+        with stack:
+            out = plain(self.render(columns=self.WIDE))
+        self.assertIn("main ~1 ?1", out)
+        self.assertIsInstance(json.loads((self.dir / sl.PROBE_CACHE_NAME).read_text(encoding="utf-8")), dict)
+
+
+class BadUsageCache(TempClaudeDir, unittest.TestCase):
+    """A wrongly shaped statusline-usage.json must never blank the line or crash the refresh."""
+
+    GOOD = {"five_hour": {"utilization": 30, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 60, "resets_at": "2099-01-01T00:00:00Z"}}
+    BAD = ("[]", "null", '"x"', "42", '{"usage":"x"}', '{"usage":[1]}', '{"usage":{"five_hour":"x"}}',
+           '{"usage":{"five_hour":{"utilization":"hi","resets_at":"2099-01-01T00:00:00Z"}}}',
+           '{"usage":{"five_hour":{"utilization":5,"resets_at":{"a":1}}}}',
+           '{"fetched_at":"x","tags_at":[1],"tags":"x"}', '{"usage":null}')
+
+    def test_load_returns_a_dict_for_any_shape(self):
+        for text in self.BAD:
+            sl.USAGE_CACHE.write_text(text, encoding="utf-8")
+            self.assertIsInstance(sl.load_usage_cache(), dict, text)
+
+    def test_bad_inner_window_is_dropped_but_good_one_kept(self):
+        import json
+        usage = {"five_hour": {"utilization": "hi", "resets_at": "2099-01-01T00:00:00Z"},
+                 "seven_day": self.GOOD["seven_day"]}
+        sl.USAGE_CACHE.write_text(json.dumps({"usage": usage, "fetched_at": "x"}), encoding="utf-8")
+        got = sl.load_usage_cache()
+        self.assertNotIn("five_hour", got["usage"])
+        self.assertEqual(got["usage"]["seven_day"]["utilization"], 60)
+        self.assertNotIn("fetched_at", got)
+
+    def test_every_render_still_shows_the_line(self):
+        from unittest import mock
+        for text in self.BAD:
+            sl.USAGE_CACHE.write_text(text, encoding="utf-8")
+            with mock.patch.object(sl, "maybe_refresh"), mock.patch.object(sl, "read_oauth_token", return_value=None):
+                out = plain(self.render(live_usage=True))
+            self.assertIn("ctx 43%", out, text)
+            self.assertNotIn("Claude | --", out, text)
+
+    def test_unvalidated_merge_failure_falls_back_to_stdin_data(self):
+        from unittest import mock
+        with mock.patch.object(sl, "load_usage_cache", return_value={"usage": {"five_hour": {"utilization": "hi"}}}), \
+                mock.patch.object(sl, "maybe_refresh"):
+            out = plain(self.render(live_usage=True))
+        self.assertIn("5h 19%", out)
+
+    def test_refresh_survives_and_rewrites_a_bad_file(self):
+        import json
+        from unittest import mock
+        for text in self.BAD:
+            sl.USAGE_CACHE.write_text(text, encoding="utf-8")
+            with mock.patch.object(sl, "_fetch_usage"), mock.patch("urllib.request.urlopen", side_effect=OSError):
+                sl.refresh_cache()
+            self.assertIsInstance(json.loads(sl.USAGE_CACHE.read_text(encoding="utf-8")), dict, text)
+
+
+class CheapWins(unittest.TestCase):
+    def test_ctypes_is_not_imported_when_the_terminal_announces_itself(self):
+        from unittest import mock
+        for var in ("WT_SESSION", "TERM_PROGRAM"):
+            fake = mock.MagicMock()
+            with mock.patch.dict(os.environ, {var: "x"}), mock.patch.dict(sys.modules, {"ctypes": fake}), \
+                    mock.patch.object(sl.os, "name", "nt"):
+                got = sl.console_window_class()
+            self.assertEqual(fake.mock_calls, [], var)
+            self.assertIsNone(got)
+            with mock.patch.dict(os.environ, {var: "x"}):
+                self.assertEqual(sl.effective_icons("nerd"), "nerd")
+
+    def test_ctypes_is_still_asked_without_a_terminal_hint(self):
+        from unittest import mock
+        fake = mock.MagicMock()
+        fake.windll.kernel32.GetConsoleWindow.return_value = 0
+        env = {k: v for k, v in os.environ.items() if k not in ("WT_SESSION", "TERM_PROGRAM")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules, {"ctypes": fake}), \
+                mock.patch.object(sl.os, "name", "nt"):
+            self.assertEqual(sl.console_window_class(), "")
+
+    def test_port_probe_waits_20ms(self):
+        import inspect
+        self.assertEqual(inspect.signature(sl.open_ports).parameters["timeout"].default, 0.02)
+
+    def test_a_local_listener_is_found_every_time_and_a_closed_port_is_not(self):
+        import socket
+        with socket.socket() as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(50)
+            port = srv.getsockname()[1]
+            with socket.socket() as spare:
+                spare.bind(("127.0.0.1", 0))
+                closed = spare.getsockname()[1]
+            for _ in range(20):
+                self.assertEqual(sl.open_ports([closed, port]), [port])
+
+
+class StandaloneRun(TempClaudeDir, unittest.TestCase):
+    """The status line runs as `python -S statusline.py --icons nerd`: stdlib only, no site-packages."""
+
+    def test_runs_under_python_dash_S_as_one_line(self):
+        import json
+        import subprocess
+        data = dict(SingleLine.DATA, workspace={"current_dir": str(self.proj)},
+                    rate_limits={"five_hour": {"used_percentage": 74, "resets_at": time.time() + 7800},
+                                 "seven_day": {"used_percentage": 69, "resets_at": time.time() + 400_000}})
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.dir), STATUSLINE_LIVE_USAGE="0", COLUMNS="120",
+                   WT_SESSION="x", PYTHONIOENCODING="utf-8")
+        r = subprocess.run([sys.executable, "-S", sl.__file__, "--icons", "nerd"], input=json.dumps(data),
+                           capture_output=True, text=True, encoding="utf-8", env=env, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        out = plain(r.stdout.rstrip("\n"))
+        self.assertNotIn("\n", out)
+        self.assertLessEqual(sl.visible_width(out), 120 - sl.EDGE)
+        for want in ("my-special-proj", "Opus 5.5", "ctx 43%", "5h 74%", "7d 69%", "35.50"):
+            self.assertIn(want, out)
+
+
+class RefreshProcess(TempClaudeDir, unittest.TestCase):
+    """The detached --refresh child: its lock is its own, and it never outlives its deadline."""
+
+    def run_refresh(self, argv, refresh=None):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["statusline.py"] + argv), \
+                mock.patch.object(sl, "refresh_cache", refresh or (lambda: None)) as fn, \
+                mock.patch.object(sl, "_arm_deadline"):
+            sl.main()
+        return fn
+
+    def test_maybe_refresh_hands_the_child_its_lock_token(self):
+        from unittest import mock
+        with mock.patch("subprocess.Popen") as popen:
+            sl.maybe_refresh({}, NOW)
+        args = popen.call_args.args[0]
+        token = args[args.index("--lock-token") + 1]
+        self.assertIn("--refresh", args)
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), token)
+
+    def test_a_failed_spawn_frees_only_our_own_lock(self):
+        from unittest import mock
+        with mock.patch("subprocess.Popen", side_effect=OSError):
+            sl.maybe_refresh({}, NOW)
+        self.assertFalse(sl.USAGE_LOCK.exists())
+
+    def test_child_removes_the_lock_it_was_given(self):
+        sl.USAGE_LOCK.write_text("tok", encoding="utf-8")
+        fn = self.run_refresh(["--refresh", "--lock-token", "tok"], refresh=lambda: None)
+        self.assertFalse(sl.USAGE_LOCK.exists())
+
+    def test_child_leaves_a_lock_that_is_not_its_own(self):
+        sl.USAGE_LOCK.write_text("someone-else", encoding="utf-8")
+        self.run_refresh(["--refresh", "--lock-token", "tok"])
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "someone-else")
+
+    def test_child_removes_nothing_when_refreshing_crashes_after_losing_its_lock(self):
+        def crash():
+            sl.USAGE_LOCK.write_text("newer-owner", encoding="utf-8")
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            self.run_refresh(["--refresh", "--lock-token", "tok"], refresh=crash)
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "newer-owner")
+
+    def test_a_manual_refresh_takes_the_lock_itself_or_gives_up(self):
+        calls = []
+        sl.USAGE_LOCK.write_text("running", encoding="utf-8")
+        self.run_refresh(["--refresh"], refresh=lambda: calls.append(1))
+        self.assertEqual(calls, [])
+        self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "running")
+        sl.USAGE_LOCK.unlink()
+        self.run_refresh(["--refresh"], refresh=lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+        self.assertFalse(sl.USAGE_LOCK.exists())
+
+    def test_deadline_timer_is_a_15_second_daemon(self):
+        from unittest import mock
+        with mock.patch("threading.Timer") as timer:
+            sl._arm_deadline("tok")
+        interval, fn = timer.call_args.args[:2]
+        self.assertEqual(interval, 15)
+        self.assertTrue(timer.return_value.daemon)
+        timer.return_value.start.assert_called_once()
+        self.assertIs(fn, sl._expire)
+
+    def test_expiring_exits_and_unlocks_only_our_lock(self):
+        from unittest import mock
+        sl.USAGE_LOCK.write_text("tok", encoding="utf-8")
+        with mock.patch.object(sl.os, "_exit") as leave:
+            sl._expire("tok")
+        leave.assert_called_once()
+        self.assertFalse(sl.USAGE_LOCK.exists())
+        sl.USAGE_LOCK.write_text("other", encoding="utf-8")
+        with mock.patch.object(sl.os, "_exit"):
+            sl._expire("tok")
+        self.assertTrue(sl.USAGE_LOCK.exists())
+
+    def test_a_hung_refresh_process_really_exits_at_the_deadline(self):
+        import subprocess
+        script = (
+            "import sys, time, statusline as sl\n"
+            "sl.REFRESH_DEADLINE = 0.3\n"
+            "sl.refresh_cache = lambda: time.sleep(30)\n"
+            "sys.argv = ['statusline.py', '--refresh', '--lock-token', 'tok']\n"
+            "sl.main()\n")
+        sl.USAGE_LOCK.write_text("tok", encoding="utf-8")
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.dir))
+        start = time.monotonic()
+        r = subprocess.run([sys.executable, "-c", script], cwd=str(pathlib.Path(sl.__file__).parent),
+                           env=env, timeout=20, capture_output=True)
+        self.assertLess(time.monotonic() - start, 10, r.stderr)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(sl.USAGE_LOCK.exists())
 
 
 if __name__ == "__main__":
