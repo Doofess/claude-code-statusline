@@ -109,11 +109,13 @@ In `~/.claude/settings.json`:
 
 The same command works on macOS, Linux and Windows (Claude Code expands `~`). `refreshInterval` (seconds) re-renders while the session is idle; without it Claude Code only redraws on new messages, so the usage numbers freeze between turns.
 
-With a Nerd Font set as your terminal font (e.g. *CaskaydiaMono Nerd Font*), add the flag:
+With a Nerd Font set as your terminal font (e.g. *JetBrainsMono Nerd Font*), add the flag:
 
 ```json
 "command": "python ~/.claude/statusline.py --icons nerd"
 ```
+
+Getting the font: `winget install DEVCOM.JetBrainsMonoNerdFont` on Windows, `brew install --cask font-jetbrains-mono-nerd-font` on macOS, or download one from [nerdfonts.com](https://www.nerdfonts.com). Then select it in the terminal's font setting (Windows Terminal: Settings, Defaults, Appearance, Font face). Without the font the glyphs show as boxes; leave the flag off and the plain mode needs nothing extra.
 
 Optional, a faster launch: `python -S` skips the `site` module, and importing the script lets Python reuse the compiled module in `~/.claude/__pycache__` instead of compiling the file on every render. Same output, a few milliseconds less per render:
 
