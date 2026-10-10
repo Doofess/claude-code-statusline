@@ -89,12 +89,20 @@ uvx --from git+https://github.com/Doofess/claude-code-statusline claude-statusli
 pipx run --spec git+https://github.com/Doofess/claude-code-statusline claude-statusline install
 ```
 
-It copies `statusline.py` to `~/.claude`, backs up `settings.json` (to `~/.claude/backups/statusline-<time>/`), sets `statusLine` to the fast launch below with `refreshInterval` 1, renders a sample line as a self-test, and puts everything back if that test fails. Nothing stays installed in uv or pipx: the status line is the one copied file, so a render never pays for a package wrapper. Restart Claude Code afterwards.
+It does everything the icons need, so the line works as soon as you restart Claude Code:
+
+1. Copies `statusline.py` to `~/.claude`, backs up `settings.json` (to `~/.claude/backups/statusline-<time>/`), and sets `statusLine` to the fast launch below with `refreshInterval` 1.
+2. **Installs a Nerd Font** when the machine has none: winget on Windows and Homebrew on macOS when present, otherwise a download of the pinned CaskaydiaMono Nerd Font release from GitHub (about 56 MB, four files, per user, no admin rights).
+3. **Sets that font in your terminal** when it can: Windows Terminal (`profiles.defaults.font.face`) and VS Code (`terminal.integrated.fontFamily`). A file that already names a Nerd Font is left alone; one that names another font gets the Nerd Font in its place, and every file is backed up first. Other terminals (iTerm2, Terminal.app, GNOME Terminal) cannot be configured safely from a script, so it prints where to pick the font.
+4. Renders a sample line as a self-test and puts `settings.json` back if that fails.
+
+Nothing stays installed in uv or pipx: the status line is the one copied file, so a render never pays for a package wrapper. **Windows Terminal reads installed fonts only when it starts**, so after a first install close every Windows Terminal window and open a new one, then restart Claude Code.
 
 | Flag | Effect |
 | --- | --- |
-| `--icons auto` (default) | Nerd icons when a Nerd Font file is installed, plain otherwise. `nerd` and `none` force one. |
-| `--dry-run` | Print what it would do; write nothing. |
+| `--icons auto` (default) | Nerd icons, installing the font if needed; plain when no font can be had. `nerd` and `none` force one (`none` skips the font work). |
+| `--no-font` | Never install a font or edit terminal settings. |
+| `--dry-run` | Print what it would do (font, terminal files, settings); write nothing. |
 | `--no-test` | Skip the self-test. |
 | `--claude-dir PATH` | Another config directory (default `CLAUDE_CONFIG_DIR`, else `~/.claude`). |
 

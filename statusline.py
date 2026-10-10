@@ -266,8 +266,13 @@ def _probe_console_host():
     return console_host(chain, windows)
 
 
-def terminal_kind(cache=None):
-    """console_host() for this Windows session, kept CONSOLE_TTL seconds per parent process; None elsewhere.
+def terminal_kind(cache=None, session=None):
+    """console_host() for this Windows session, kept CONSOLE_TTL seconds; None elsewhere.
+
+    The verdict is stored per Claude Code session (its session_id), because the parent
+    process is no use as a key: Claude Code starts the status line through a shell that
+    lives for one render, so the parent pid is new every second and nothing would ever hit.
+    Without a session id the parent pid is the fallback key.
 
     A terminal that announces itself (WT_SESSION, TERM_PROGRAM) is never asked about: the
     answer would be 'keep nerd' and ctypes costs ~6 ms. Any failure is no verdict.
@@ -280,10 +285,10 @@ def terminal_kind(cache=None):
             return _probe_console_host()
         except Exception:
             return None
-    return _probe_cache(cache).get(f"console:{os.getppid()}", CONSOLE_TTL, probe)
+    return _probe_cache(cache).get(f"console:{session or os.getppid()}", CONSOLE_TTL, probe)
 
 
-def effective_icons(mode, cache=None):
+def effective_icons(mode, cache=None, session=None):
     """The requested icon set, unless this terminal cannot draw it.
 
     The classic Windows console shows Nerd Font glyphs as boxes (and miscounts their
@@ -292,7 +297,7 @@ def effective_icons(mode, cache=None):
     """
     if mode != "nerd" or os.environ.get("STATUSLINE_FORCE_ICONS"):
         return mode
-    return "none" if terminal_kind(cache) == "classic" else mode
+    return "none" if terminal_kind(cache, session) == "classic" else mode
 
 
 def set_icons(mode):
@@ -454,6 +459,7 @@ class ProbeCache:
     CLAIM_TTL = 5     # seconds before a claim left by a dead session is ignored
     CLAIM_WAIT = 0.25  # seconds to wait for another session's probe of a key we have no value for
     KEEP = 60         # seconds an entry stored without a TTL (put) stays in the file
+    MAX_VERDICTS = 40  # terminal verdicts ('console:<session>') kept; the oldest go first
 
     def __init__(self, path, now):
         self.path, self.now, self.dirty = path, now, False
@@ -587,6 +593,10 @@ class ProbeCache:
                     merged[key] = mine
             entries = {k: e for k, e in merged.items()
                        if -self.SKEW <= self.now - e["at"] < (e.get("ttl") if _number(e.get("ttl")) else self.KEEP)}
+            # Terminal verdicts live an hour. A key that never repeats must not pile up, so keep the newest few.
+            verdicts = sorted((k for k in entries if k.startswith("console:")), key=lambda k: entries[k]["at"])
+            for k in verdicts[:-self.MAX_VERDICTS]:
+                del entries[k]
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(entries, f)
             for attempt in range(3):
@@ -1722,11 +1732,14 @@ INSTALL_RECORD = "statusline-install.json"  # remembers the statusLine an instal
 SAMPLE_PAYLOAD = {"model": {"display_name": "Test"}, "context_window": {"used_percentage": 12,
                                                                         "context_window_size": 1000000}}
 INSTALL_USAGE = """\
-Usage: claude-statusline install [--icons auto|nerd|none] [--dry-run] [--no-test]
+Usage: claude-statusline install [--icons auto|nerd|none] [--no-font] [--dry-run] [--no-test]
        claude-statusline uninstall [--dry-run]
-  install    copy the script to ~/.claude and set statusLine (backs up settings.json first)
+  install    copy the script to ~/.claude and set statusLine (backs up settings.json first); with Nerd
+             icons it also installs a Nerd Font if the machine has none and sets it as the font of
+             Windows Terminal and VS Code (backing those files up first)
   uninstall  restore the previous statusLine, or remove ours, and delete the copied script
-  --icons    nerd needs a Nerd Font in the terminal; auto picks nerd only when one is installed
+  --icons    nerd needs a Nerd Font in the terminal; auto (default) uses nerd, fetching the font when needed
+  --no-font  never install a font or touch terminal settings
   --claude-dir PATH  use another config dir (default: CLAUDE_CONFIG_DIR or ~/.claude)
 """
 
@@ -1753,21 +1766,292 @@ def _find_python():
     return None
 
 
-def _has_nerd_font():
-    """True when a Nerd Font file is installed (not proof the terminal uses it)."""
-    home = HOME
-    dirs = [os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
+NERD_FONT_VERSION = "v3.5.1"  # the release the direct download below is pinned to
+NERD_FONT_ZIP = "CascadiaMono"  # its files are CaskaydiaMonoNerdFont-<style>.ttf: the face "CaskaydiaMono Nerd Font"
+NERD_FONT_URL = f"https://github.com/ryanoasis/nerd-fonts/releases/download/{NERD_FONT_VERSION}/{NERD_FONT_ZIP}.zip"
+NERD_FONT_FACE = "CaskaydiaMono Nerd Font"
+NERD_FONT_STYLES = ("Regular", "Bold", "Italic", "BoldItalic")
+
+
+def _font_dirs():
+    return [os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
             os.path.join(os.environ.get("WINDIR", ""), "Fonts"),
-            os.path.join(home, "Library", "Fonts"), "/Library/Fonts",
-            os.path.join(home, ".local", "share", "fonts"), os.path.join(home, ".fonts"),
+            os.path.join(HOME, "Library", "Fonts"), "/Library/Fonts",
+            os.path.join(HOME, ".local", "share", "fonts"), os.path.join(HOME, ".fonts"),
             "/usr/share/fonts", "/usr/local/share/fonts"]
-    for d in dirs:
+
+
+def _user_font_dir():
+    if os.name == "nt":
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local"),
+                            "Microsoft", "Windows", "Fonts")
+    if sys.platform == "darwin":
+        return os.path.join(HOME, "Library", "Fonts")
+    return os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "fonts")
+
+
+def _nerd_font_face():
+    """The family name of an installed Nerd Font, as a terminal setting wants it, or None.
+
+    Nerd Font files are named <Family>NerdFont-Regular.ttf (and ...NerdFontMono-..., ...NerdFontPropo-...),
+    and the family it registers is '<Family> Nerd Font'. Proportional and Mono variants are skipped so the
+    face is the one that keeps one cell per glyph. JetBrainsMono and CaskaydiaMono win when present."""
+    found = []
+    for d in _font_dirs():
         if not d or not os.path.isdir(d):
             continue
         for _root, _dirs, files in os.walk(d):
-            if any("nerd" in f.lower() for f in files):
-                return True
+            for f in files:
+                m = re.match(r"^(.+?)NerdFont-Regular\.(?:ttf|otf)$", f)
+                if m:
+                    found.append(f"{m.group(1)} Nerd Font")
+    if not found:
+        return None
+    for preferred in ("JetBrainsMono Nerd Font", NERD_FONT_FACE):
+        if preferred in found:
+            return preferred
+    return sorted(found)[0]
+
+
+def _has_nerd_font():
+    """True when any Nerd Font file is installed (not proof the terminal uses it)."""
+    if _nerd_font_face():
+        return True
+    for d in _font_dirs():
+        if d and os.path.isdir(d):
+            for _root, _dirs, files in os.walk(d):
+                if any("nerd" in f.lower() for f in files):
+                    return True
     return False
+
+
+def _extract_fonts(zip_path, dest_dir):
+    """Copy the four CaskaydiaMono Nerd Font styles out of the release zip into dest_dir; the paths written."""
+    import zipfile
+    wanted = {f"CaskaydiaMonoNerdFont-{s}.ttf" for s in NERD_FONT_STYLES}
+    os.makedirs(dest_dir, exist_ok=True)
+    written = []
+    with zipfile.ZipFile(zip_path) as z:
+        for info in z.infolist():
+            name = os.path.basename(info.filename)
+            if name in wanted:
+                target = os.path.join(dest_dir, name)
+                with z.open(info) as src, open(target, "wb") as out:
+                    out.write(src.read())
+                written.append(target)
+    return written
+
+
+def _register_fonts_windows(paths):
+    """Per-user font registration: registry values plus AddFontResource, so no admin rights are needed."""
+    import winreg
+    key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows NT\CurrentVersion\Fonts",
+                             0, winreg.KEY_SET_VALUE)
+    with key:
+        for p in paths:
+            style = os.path.splitext(os.path.basename(p))[0].rpartition("-")[2]  # 'BoldItalic'
+            name = f"{NERD_FONT_FACE} {re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', style)} (TrueType)"  # as Windows names its own
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, p)
+    try:
+        import ctypes
+        for p in paths:
+            ctypes.windll.gdi32.AddFontResourceW(p)
+    except Exception:
+        pass
+
+
+def _install_nerd_font():
+    """Install a Nerd Font for this user. The face name on success, else None (the reason is printed).
+
+    Windows tries winget and macOS tries Homebrew first (signed, hashed packages); anything that fails
+    falls back to downloading the pinned release zip from github.com/ryanoasis/nerd-fonts."""
+    import shutil
+    import subprocess
+    tools = []
+    if os.name == "nt" and shutil.which("winget"):
+        tools.append(["winget", "install", "--id", "DEVCOM.JetBrainsMonoNerdFont", "-e", "--silent",
+                      "--accept-package-agreements", "--accept-source-agreements"])
+    elif sys.platform == "darwin" and shutil.which("brew"):
+        tools.append(["brew", "install", "--cask", "font-jetbrains-mono-nerd-font"])
+    for cmd in tools:
+        print(f"  installing a Nerd Font with {cmd[0]} ...")
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except Exception as e:
+            print(f"  {cmd[0]} failed ({e})")
+        face = _nerd_font_face()
+        if face:
+            return face
+    print(f"  downloading {NERD_FONT_ZIP} Nerd Font {NERD_FONT_VERSION} from GitHub (about 54 MB) ...")
+    import tempfile
+    import urllib.request
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = os.path.join(tmp, "font.zip")
+            req = urllib.request.Request(NERD_FONT_URL, headers={"User-Agent": "claude-statusline"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(zpath, "wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+            written = _extract_fonts(zpath, _user_font_dir())
+        if not written:
+            print("  the download held no CaskaydiaMono Nerd Font files")
+            return None
+        if os.name == "nt":
+            _register_fonts_windows(written)
+        elif sys.platform != "darwin" and shutil.which("fc-cache"):
+            subprocess.run(["fc-cache", "-f", _user_font_dir()], capture_output=True, timeout=120)
+        return NERD_FONT_FACE
+    except Exception as e:
+        print(f"  could not install a Nerd Font ({e}); install one from https://www.nerdfonts.com")
+        return None
+
+
+# ---- terminal font settings (JSON with comments, so edited as text) ----
+
+def _json_skip(text, i):
+    """The index after the string or comment that starts at text[i], or i when none does."""
+    c = text[i]
+    if c == '"':
+        j = i + 1
+        while j < len(text) and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return j + 1
+    if text.startswith("//", i):
+        j = text.find("\n", i)
+        return len(text) if j < 0 else j
+    if text.startswith("/*", i):
+        j = text.find("*/", i + 2)
+        return len(text) if j < 0 else j + 2
+    return i
+
+
+def _json_close(text, open_idx):
+    """The index of the brace that closes the one at open_idx (strings and comments skipped), or -1."""
+    depth, i = 0, open_idx
+    while i < len(text):
+        j = _json_skip(text, i)
+        if j != i:
+            i = j
+            continue
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _first_brace(text):
+    i = 0
+    while i < len(text):
+        j = _json_skip(text, i)
+        if j != i:
+            i = j
+        elif text[i] == "{":
+            return i
+        else:
+            i += 1
+    return -1
+
+
+FACE_RE = r'"face"\s*:\s*"((?:[^"\\]|\\.)*)"'
+
+
+def _wt_font_edit(text, face):
+    """(new text, outcome) for a Windows Terminal settings file. profiles.defaults gets the font face:
+    'set' (added or replaced a non-Nerd face), 'kept' (already a Nerd Font), 'none' (no defaults block)."""
+    m = re.search(r'"defaults"\s*:\s*\{', text)
+    if not m:
+        return text, "none"
+    open_idx = m.end() - 1
+    close = _json_close(text, open_idx)
+    if close < 0:
+        return text, "none"
+    block = text[open_idx + 1:close]
+    fm = re.search(r'"font"\s*:\s*\{', block)
+    if not fm:
+        return text[:open_idx + 1] + f' "font": {{ "face": "{face}" }},' + text[open_idx + 1:], "set"
+    f_open = open_idx + 1 + fm.end() - 1
+    f_close = _json_close(text, f_open)
+    font_text = text[f_open:f_close + 1]
+    am = re.search(FACE_RE, font_text)
+    if am is None:
+        return text[:f_open + 1] + f' "face": "{face}",' + text[f_open + 1:], "set"
+    if "nerd" in am.group(1).lower():
+        return text, "kept"
+    s, e = f_open + am.start(1), f_open + am.end(1)
+    return text[:s] + face + text[e:], "set"
+
+
+def _vscode_font_edit(text, face):
+    """(new text, outcome) for VS Code user settings: terminal.integrated.fontFamily gets the Nerd Font first."""
+    m = re.search(r'"terminal\.integrated\.fontFamily"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if m:
+        if "nerd" in m.group(1).lower():
+            return text, "kept"
+        old = m.group(1)
+        return text[:m.start(1)] + f"{face}, {old}" + text[m.end(1):], "set"
+    brace = _first_brace(text)
+    if brace < 0:
+        return text, "none"
+    return text[:brace + 1] + f' "terminal.integrated.fontFamily": "{face}",' + text[brace + 1:], "set"
+
+
+def _terminal_settings_files():
+    """[(label, path, edit function)] for the terminal config files that exist on this machine."""
+    app = os.environ.get("APPDATA") or os.path.join(HOME, "AppData", "Roaming")
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
+    files = []
+    if os.name == "nt":
+        for sub in (os.path.join("Packages", "Microsoft.WindowsTerminal_8wekyb3d8bbwe", "LocalState"),
+                    os.path.join("Packages", "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe", "LocalState"),
+                    os.path.join("Microsoft", "Windows Terminal")):
+            files.append(("Windows Terminal", os.path.join(local, sub, "settings.json"), _wt_font_edit))
+    if os.name == "nt":
+        code = app
+    elif sys.platform == "darwin":
+        code = os.path.join(HOME, "Library", "Application Support")
+    else:
+        code = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    for product in ("Code", "Code - Insiders"):
+        files.append(("VS Code", os.path.join(code, product, "User", "settings.json"), _vscode_font_edit))
+    return [(label, path, fn) for label, path, fn in files if os.path.isfile(path)]
+
+
+def _configure_terminals(face, save_copy, dry=False):
+    """Point every terminal config found at `face`. Returns the lines to print. save_copy(path, label)
+    makes a backup first; a file that already names a Nerd Font is left alone."""
+    lines, touched = [], False
+    for label, path, edit in _terminal_settings_files():
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+            new, outcome = edit(text, face)
+        except OSError as e:
+            lines.append(f"  {label}: cannot read {path} ({e})")
+            continue
+        if outcome == "kept":
+            lines.append(f"  {label}: already uses a Nerd Font")
+        elif outcome == "none":
+            lines.append(f"  {label}: set the font to \"{face}\" by hand in {path}")
+        elif dry:
+            lines.append(f"  {label}: would set the font to \"{face}\" in {path}")
+        else:
+            save_copy(path, label.replace(" ", "-").lower())
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+            os.replace(tmp, path)
+            lines.append(f"  {label}: font set to \"{face}\" ({path})")
+            touched = True
+    if not lines:
+        lines.append(f"  no Windows Terminal or VS Code settings found; select \"{face}\" as the font in your"
+                     " terminal (iTerm2: Profiles > Text, Terminal.app: Profiles > Font, GNOME Terminal: Profile > Font)")
+    if touched and os.name == "nt":
+        lines.append("  Windows Terminal reads installed fonts only when it starts: close ALL its windows and open a"
+                     " new one before the icons draw")
+    return lines
 
 
 def _launch_command(python, claude_dir, icons):
@@ -1844,13 +2128,18 @@ def install_main(args):
         pass
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
+    def save_copy(path, label=None):
+        """Copy path into this run's backup folder (never in a dry run); the folder, or None."""
+        if dry:
+            return None
+        dest = os.path.join(cdir, "backups", f"statusline-{stamp}")
+        os.makedirs(dest, exist_ok=True)
+        name = os.path.basename(path) if label is None else f"{label}-{os.path.basename(path)}"
+        shutil.copy2(path, os.path.join(dest, name))
+        return dest
+
     def backup():
-        if os.path.exists(settings_path) and not dry:
-            dest = os.path.join(cdir, "backups", f"statusline-{stamp}")
-            os.makedirs(dest, exist_ok=True)
-            shutil.copy2(settings_path, dest)
-            return dest
-        return None
+        return save_copy(settings_path) if os.path.exists(settings_path) else None
 
     if uninstall:
         current = settings.get("statusLine")
@@ -1891,7 +2180,21 @@ def install_main(args):
     if icons not in ("auto", "nerd", "none", "plain"):
         print(INSTALL_USAGE, end="")
         return 2
-    font = _has_nerd_font()
+    want_font = icons in ("auto", "nerd") and "--no-font" not in args
+    face = _nerd_font_face() if want_font else None
+    font_lines = []
+    if want_font and dry:
+        font_lines = ([] if face or _has_nerd_font() else [f"  would install the Nerd Font {NERD_FONT_FACE}"]) \
+            + _configure_terminals(face or NERD_FONT_FACE, save_copy, dry=True)
+    elif want_font:
+        os.makedirs(cdir, exist_ok=True)
+        if face is None and not _has_nerd_font():
+            face = _install_nerd_font()
+        if face:
+            font_lines = _configure_terminals(face, save_copy)
+        elif _has_nerd_font():
+            font_lines = ["  a Nerd Font is installed; make sure your terminal's font is set to it"]
+    font = bool(face) or _has_nerd_font()
     if icons == "auto":
         icons = "nerd" if font else "none"
     icons = "none" if icons == "plain" else icons
@@ -1902,6 +2205,8 @@ def install_main(args):
     if dry:
         print(f"statusline: dry run in {cdir}\n  copy {os.path.abspath(__file__)} -> {dest}\n"
               f"  statusLine.command = {command}\n  refreshInterval = 1, icons = {icons}")
+        for line in font_lines:
+            print(line)
         return 0
     os.makedirs(cdir, exist_ok=True)
     backed_up = backup()
@@ -1938,11 +2243,12 @@ def install_main(args):
     print(f"statusline: installed to {dest}")
     if backed_up:
         print(f"  settings.json backed up in {backed_up}")
+    for line in font_lines:
+        print(line)
     if icons == "nerd" and not font:
         print("  note: no Nerd Font found; install one and select it in your terminal, or reinstall with --icons none")
     elif icons == "none":
-        print("  plain icons: install a Nerd Font (https://www.nerdfonts.com), select it in your terminal, then run"
-              " `install --icons nerd` for the icon set")
+        print("  plain icons: run `install --icons nerd` to get the Nerd Font icon set (it installs the font too)")
     print("  restart Claude Code to see it")
     return 0
 
@@ -1977,9 +2283,10 @@ def main():
     try:
         now = time.time()
         probes = ProbeCache(os.path.join(CLAUDE_DIR, PROBE_CACHE_NAME), now)
-        set_icons(effective_icons(mode, probes))
         raw = read_stdin()
         data = json.loads(raw) if raw.strip() else {}
+        sid = data.get("session_id") if isinstance(data, dict) else None
+        set_icons(effective_icons(mode, probes, sid[:64] if isinstance(sid, str) and sid else None))
         stdin_rl = data.get("rate_limits")
         stdin_rl = stdin_rl if isinstance(stdin_rl, dict) else {}
         live = None

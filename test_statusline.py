@@ -2001,6 +2001,41 @@ class CheapWins(unittest.TestCase):
                 self.assertEqual(sl.effective_icons("nerd", later), "nerd")  # the env still wins, no probe needed
             self.assertEqual(probe.call_count, 2)
 
+    def test_the_verdict_is_keyed_by_session_so_a_changing_parent_pid_still_hits(self):
+        import json
+        import tempfile
+        env = {k: v for k, v in os.environ.items() if k not in ("WT_SESSION", "TERM_PROGRAM")}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sl, "_probe_console_host", return_value="pty") as probe, \
+                mock.patch.object(sl.os, "name", "nt"):
+            path = os.path.join(tmp, sl.PROBE_CACHE_NAME)
+            for parent in (101, 102, 103):  # Claude Code runs the status line through a new shell each time
+                with mock.patch.object(sl.os, "getppid", return_value=parent):
+                    cache = sl.ProbeCache(path, NOW)
+                    self.assertEqual(sl.effective_icons("nerd", cache, "sess-1"), "nerd")
+                    cache.save()
+            self.assertEqual(probe.call_count, 1)
+            with open(path, encoding="utf-8") as f:
+                keys = [k for k in json.load(f) if k.startswith("console:")]
+            self.assertEqual(keys, ["console:sess-1"])
+
+    def test_old_terminal_verdicts_are_capped_so_the_cache_cannot_grow_without_bound(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, sl.PROBE_CACHE_NAME)
+            cache = sl.ProbeCache(path, NOW)
+            for i in range(300):
+                cache.entries[f"console:{i}"] = {"at": NOW - 300 + i, "v": "pty", "ttl": sl.CONSOLE_TTL}
+                cache.touched.add(f"console:{i}")
+            cache.dirty = True
+            cache.save()
+            with open(path, encoding="utf-8") as f:
+                kept = [k for k in json.load(f) if k.startswith("console:")]
+            self.assertEqual(len(kept), sl.ProbeCache.MAX_VERDICTS)
+            self.assertIn("console:299", kept)
+            self.assertNotIn("console:0", kept)
+
     def test_port_probe_waits_20ms(self):
         import inspect
         self.assertEqual(inspect.signature(sl.open_ports).parameters["timeout"].default, 0.02)
@@ -2404,7 +2439,7 @@ class InstallCommand(unittest.TestCase):
         self.assertEqual(len(list((self.dir / "backups").glob("statusline-*/settings.json"))), 1)
 
     def test_nerd_icons_add_the_flag_and_the_command_points_at_a_custom_dir(self):
-        code, out = self.run_cli("install", "--icons", "nerd", "--no-test")
+        code, out = self.run_cli("install", "--icons", "nerd", "--no-test", "--no-font")
         self.assertEqual(code, 0, out)
         command = self.load()["statusLine"]["command"]
         self.assertTrue(command.endswith(" --icons nerd"))
@@ -2475,6 +2510,147 @@ class InstallCommand(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.load(), {"model": "x"})
         self.assertIn("put back", out)
+
+    WT = """{
+    // keep this comment { with a brace
+    "defaultProfile": "{61c54bbd}",
+    "profiles": {
+        "defaults": {
+            "cursorShape": "bar"
+        },
+        "list": [{ "name": "PowerShell", "font": { "face": "Consolas" } }]
+    }
+}"""
+
+    def test_wt_gets_a_font_when_defaults_name_none_and_comments_survive(self):
+        new, outcome = sl._wt_font_edit(self.WT, "Foo Nerd Font")
+        self.assertEqual(outcome, "set")
+        self.assertIn('"defaults": { "font": { "face": "Foo Nerd Font" },', new)
+        self.assertIn("// keep this comment { with a brace", new)
+        self.assertEqual(sl._wt_font_edit(new, "Foo Nerd Font")[1], "kept")
+        self.assertIn('"face": "Consolas"', new)  # another profile's own font is not touched
+
+    def test_wt_replaces_a_non_nerd_default_face_and_keeps_a_nerd_one(self):
+        text = '{"profiles":{"defaults":{"font":{"face":"Cascadia Mono","size":11}},"list":[]}}'
+        new, outcome = sl._wt_font_edit(text, "Foo Nerd Font")
+        self.assertEqual(outcome, "set")
+        self.assertEqual(self.json.loads(new)["profiles"]["defaults"]["font"],
+                         {"face": "Foo Nerd Font", "size": 11})
+        text = '{"profiles":{"defaults":{"font":{"face":"JetBrainsMono Nerd Font"}}}}'
+        self.assertEqual(sl._wt_font_edit(text, "Foo Nerd Font"), (text, "kept"))
+
+    def test_wt_font_object_without_a_face_gets_one_and_no_defaults_block_is_reported(self):
+        text = '{"profiles":{"defaults":{"font":{"size":12}}}}'
+        new, outcome = sl._wt_font_edit(text, "Foo Nerd Font")
+        self.assertEqual(self.json.loads(new)["profiles"]["defaults"]["font"],
+                         {"face": "Foo Nerd Font", "size": 12})
+        self.assertEqual(sl._wt_font_edit('{"profiles":{"list":[]}}', "X")[1], "none")
+
+    def test_vscode_font_family_is_added_or_prefixed_but_a_nerd_font_is_kept(self):
+        text = '{\n  // editor\n  "editor.fontSize": 14\n}'
+        new, outcome = sl._vscode_font_edit(text, "Foo Nerd Font")
+        self.assertEqual(outcome, "set")
+        self.assertIn('"terminal.integrated.fontFamily": "Foo Nerd Font",', new)
+        self.assertIn("// editor", new)
+        text = '{"terminal.integrated.fontFamily": "Consolas"}'
+        self.assertEqual(self.json.loads(sl._vscode_font_edit(text, "Foo Nerd Font")[0])
+                         ["terminal.integrated.fontFamily"], "Foo Nerd Font, Consolas")
+        keep = '{"terminal.integrated.fontFamily": "Hack Nerd Font Mono"}'
+        self.assertEqual(sl._vscode_font_edit(keep, "Foo Nerd Font"), (keep, "kept"))
+
+    def test_the_installed_face_is_read_from_the_file_names(self):
+        fonts = pathlib.Path(self.tmp.name) / "fonts"
+        fonts.mkdir()
+        for name in ("HackNerdFontMono-Regular.ttf", "HackNerdFontPropo-Regular.ttf", "CaskaydiaMonoNerdFont-Regular.ttf",
+                     "HackNerdFont-Regular.ttf", "Arial.ttf"):
+            (fonts / name).write_bytes(b"")
+        with mock.patch.object(sl, "_font_dirs", return_value=[str(fonts)]):
+            self.assertEqual(sl._nerd_font_face(), "CaskaydiaMono Nerd Font")
+            (fonts / "JetBrainsMonoNerdFont-Regular.ttf").write_bytes(b"")
+            self.assertEqual(sl._nerd_font_face(), "JetBrainsMono Nerd Font")
+        for p in fonts.iterdir():
+            p.unlink()
+        (fonts / "HackNerdFont-Regular.ttf").write_bytes(b"")
+        with mock.patch.object(sl, "_font_dirs", return_value=[str(fonts)]):
+            self.assertEqual(sl._nerd_font_face(), "Hack Nerd Font")
+        with mock.patch.object(sl, "_font_dirs", return_value=[str(fonts / "none")]):
+            self.assertIsNone(sl._nerd_font_face())
+            self.assertFalse(sl._has_nerd_font())
+
+    def test_fonts_are_extracted_from_the_release_zip_by_style(self):
+        import zipfile
+        z = pathlib.Path(self.tmp.name) / "f.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            for s in ("Regular", "Bold", "Italic", "BoldItalic", "Light"):
+                zf.writestr(f"CaskaydiaMonoNerdFont-{s}.ttf", b"x")
+            zf.writestr("CaskaydiaMonoNerdFontMono-Regular.ttf", b"x")
+            zf.writestr("README.md", b"x")
+        written = sl._extract_fonts(str(z), str(pathlib.Path(self.tmp.name) / "out"))
+        self.assertEqual(sorted(os.path.basename(p) for p in written),
+                         [f"CaskaydiaMonoNerdFont-{s}.ttf" for s in ("Bold", "BoldItalic", "Italic", "Regular")])
+
+    def test_windows_font_registration_names_values_the_way_windows_does(self):
+        values = {}
+
+        class Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        fake = mock.Mock(HKEY_CURRENT_USER=1, KEY_SET_VALUE=2, REG_SZ=3)
+        fake.CreateKeyEx.return_value = Key()
+        fake.SetValueEx.side_effect = lambda key, name, _r, _t, path: values.__setitem__(name, path)
+        with mock.patch.dict(sys.modules, {"winreg": fake}):
+            sl._register_fonts_windows([r"C:\f\CaskaydiaMonoNerdFont-Regular.ttf", r"C:\f\CaskaydiaMonoNerdFont-BoldItalic.ttf"])
+        self.assertEqual(sorted(values), ["CaskaydiaMono Nerd Font Bold Italic (TrueType)",
+                                          "CaskaydiaMono Nerd Font Regular (TrueType)"])
+        self.assertEqual(fake.CreateKeyEx.call_args.args[1], r"Software\Microsoft\Windows NT\CurrentVersion\Fonts")
+
+    def test_install_with_nerd_icons_installs_a_missing_font_and_sets_the_terminal_font(self):
+        wt = pathlib.Path(self.tmp.name) / "wt.json"
+        wt.write_text(self.WT, encoding="utf-8")
+        with mock.patch.object(sl, "_nerd_font_face", side_effect=[None, "Foo Nerd Font"]), \
+                mock.patch.object(sl, "_has_nerd_font", side_effect=[False, True, True]), \
+                mock.patch.object(sl, "_install_nerd_font", return_value="Foo Nerd Font") as fetch, \
+                mock.patch.object(sl, "_terminal_settings_files", return_value=[("Windows Terminal", str(wt), sl._wt_font_edit)]):
+            code, out = self.run_cli("install", "--no-test")
+        self.assertEqual(code, 0, out)
+        fetch.assert_called_once()
+        self.assertIn('"face": "Foo Nerd Font"', wt.read_text(encoding="utf-8"))
+        self.assertTrue(self.load()["statusLine"]["command"].endswith("--icons nerd"))
+        self.assertEqual(len(list((self.dir / "backups").glob("statusline-*/windows-terminal-wt.json"))), 1)
+
+    def test_no_font_flag_and_none_icons_never_touch_fonts_or_terminals(self):
+        with mock.patch.object(sl, "_install_nerd_font") as fetch, \
+                mock.patch.object(sl, "_terminal_settings_files") as files:
+            self.run_cli("install", "--no-test", "--no-font", "--icons", "nerd")
+            self.run_cli("install", "--no-test", "--icons", "none")
+        fetch.assert_not_called()
+        files.assert_not_called()
+
+    def test_a_failed_font_install_still_installs_the_status_line_with_plain_icons(self):
+        with mock.patch.object(sl, "_nerd_font_face", return_value=None), \
+                mock.patch.object(sl, "_has_nerd_font", return_value=False), \
+                mock.patch.object(sl, "_install_nerd_font", return_value=None):
+            code, out = self.run_cli("install", "--no-test")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--icons", self.load()["statusLine"]["command"])
+
+    def test_dry_run_reports_the_font_work_and_writes_nothing(self):
+        wt = pathlib.Path(self.tmp.name) / "wt.json"
+        wt.write_text(self.WT, encoding="utf-8")
+        with mock.patch.object(sl, "_nerd_font_face", return_value=None), \
+                mock.patch.object(sl, "_has_nerd_font", return_value=False), \
+                mock.patch.object(sl, "_install_nerd_font") as fetch, \
+                mock.patch.object(sl, "_terminal_settings_files", return_value=[("Windows Terminal", str(wt), sl._wt_font_edit)]):
+            code, out = self.run_cli("install", "--dry-run")
+        self.assertEqual(code, 0)
+        fetch.assert_not_called()
+        self.assertIn("would install the Nerd Font", out)
+        self.assertIn("would set the font", out)
+        self.assertEqual(wt.read_text(encoding="utf-8"), self.WT)
 
     def test_script_is_runnable_as_python_dash_s_install_help(self):
         import subprocess
