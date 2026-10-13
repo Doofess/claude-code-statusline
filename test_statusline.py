@@ -2247,7 +2247,8 @@ class UsageLockTakeover(TempClaudeDir, unittest.TestCase):
         self.stale_lock()
         self.assertTrue(sl._take_lock(time.time(), "me"))
         self.assertEqual(sl.USAGE_LOCK.read_text(encoding="utf-8"), "me")
-        self.assertEqual([p.name for p in self.dir.iterdir() if "lock" in p.name], [sl.USAGE_LOCK.name])
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir() if "lock" in p.name),
+                         sorted([sl.USAGE_LOCK.name, sl.USAGE_LOCK.name + ".guard"]))
 
     def test_a_fresh_lock_is_respected(self):
         sl.USAGE_LOCK.write_text("busy", encoding="utf-8")
@@ -2443,7 +2444,7 @@ class InstallCommand(unittest.TestCase):
         self.assertEqual(code, 0, out)
         command = self.load()["statusLine"]["command"]
         self.assertTrue(command.endswith(" --icons nerd"))
-        self.assertIn(str(self.dir).replace("\\", "/"), command)
+        self.assertIn(os.fsencode(str(self.dir)).hex(), command)
 
     def test_the_default_dir_is_written_as_tilde_claude(self):
         command = sl._launch_command("python", os.path.join(sl.HOME, ".claude"), "nerd")

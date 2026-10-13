@@ -22,7 +22,7 @@ claude-code-statusline › live-usage-and-redesign ~2 “statusline-py-usage-acc
 
 With `--icons nerd` the bars become three slanted segments and a few labels become glyphs. That needs a screenshot rather than a code block: run `python ~/.claude/statusline.py --demo --icons nerd` in your terminal to render these two sample lines at your window's width (nothing is read, fetched or written).
 
-One line, always. It is made for a 120-column window, fits itself to the width it is given, and never wraps.
+It is made for a 120-column window and drops optional items to fit narrower windows. The core model and percentage meters stay visible; allow at least 51 terminal columns (47 for the core plus Claude Code's padding). Below that minimum the core can wrap.
 
 ## What it shows
 
@@ -54,7 +54,7 @@ The line is kept to `COLUMNS` minus 4 (Claude Code pads the right edge). A wide 
 4. the healthy health cluster
 5. health problems, last first, each by name; when the last text goes, one bare marker stands in for all of them with the glyph and colour of the worst (`▲` red, `↑` amber, `~` grey) and, given 8 free columns, its one-word reason: `▲discord`. It outlasts everything below except model and percentages, so a failure is never invisible
 6. the session name
-7. the branch: first project and branch are squeezed into the room left (the longer loses characters from its middle, neither below 14), then the branch is cut to `live-usage-…`, then its dirty counts go (it stays amber), then the branch itself
+7. the branch: it is cut from its end to fit the room left while the project stays whole, then dropped with its dirty counts (it stays amber while present)
 8. the project: squeezed down to 14 characters, then dropped
 9. the ctx tokens
 10. the bars (7d, then 5h, then ctx)
@@ -210,4 +210,4 @@ MIT, see [LICENSE](LICENSE).
 
 Issues and PRs welcome. The script is small on purpose; please keep additions modular and opt-in.
 
-Tests: `python -m unittest test_statusline` (stdlib only). Point `CLAUDE_CONFIG_DIR` at a scratch folder and set `STATUSLINE_LIVE_USAGE=0` when running the script by hand, so your real caches stay untouched.
+Tests: `python -m unittest discover` (stdlib only). Point `CLAUDE_CONFIG_DIR` at a scratch folder and set `STATUSLINE_LIVE_USAGE=0` when running the script by hand, so your real caches stay untouched.

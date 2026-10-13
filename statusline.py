@@ -9,8 +9,8 @@ One line, always (Claude Code draws its own mode line below it), left to right:
     5h N% bar →reset │ 7d N% bar →reset │ $cost │ session time │ ✓ mcp N · version │
     skills N │ venv │ :ports
 
-It is designed for a 120-column window and fits itself to COLUMNS: wider windows show
-more, narrower ones drop items by priority (see format_statusline). It never wraps.
+It is designed for a 120-column window: wider windows show more, narrower ones drop
+items by priority (see format_statusline). Below the core meter width it can wrap.
 Items with nothing to show (no session name, no ports, no venv) are left out, and a
 health problem replaces the ✓ cluster with its own item: ▲ discord, ↑ 2.2.0, ~reload.
 Standalone: the standard library only, Python 3.10+.
@@ -363,7 +363,7 @@ RESET_FROM = 70  # a window shows when it resets only once it is this full
 
 def fmt_reset(seconds):
     """Time until a window resets, as an arrow and one unit, at most four characters: →45m, →2h, →3d."""
-    if seconds is None or seconds <= 0:
+    if not _number(seconds) or seconds <= 0:
         return ""
     m = int(seconds // 60)
     if m >= 1440:
@@ -411,8 +411,10 @@ def context_pct(cw):
     A known window size with no usage yet is 0%; None only when the size is unknown too.
     """
     try:
-        return float(cw.get("used_percentage"))
-    except (TypeError, ValueError):
+        pct = float(cw.get("used_percentage"))
+        if _number(pct):
+            return pct
+    except (TypeError, ValueError, OverflowError):
         pass
     size = cw.get("context_window_size")
     if not _number(size) or size <= 0:
@@ -665,11 +667,13 @@ def _epoch(v):
 def _window(pct, resets_at, now):
     try:
         pct = float(pct)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if pct != pct:  # NaN
+    if not _number(pct):
         return None
     reset = _epoch(resets_at)
+    if reset is not None and not _number(reset):
+        return None
     if reset is not None and reset <= now:
         # The window rolled over; this reading says nothing about the new one.
         return None
@@ -728,7 +732,8 @@ def read_oauth_token():
 
 
 def _number(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and -float("inf") < v < float("inf"))
 
 
 def _clean_usage_cache(raw):
@@ -809,11 +814,48 @@ def _fetch_usage(cache, now):
 LOCK_STALE = 30  # seconds after which a usage lock counts as left behind by a killed refresh
 
 
+def _usage_gate():
+    """Nonblocking OS lock serializing usage-lock mutations, released even on a crash.
+
+    The guard file stays on disk: deleting it would let different processes lock
+    different files with the same path. Only its first byte is locked on Windows.
+    """
+    gate = None
+    try:
+        gate = open(f"{USAGE_LOCK}.guard", "a+b")
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(gate.fileno()).st_size == 0:
+                gate.write(b"\0")
+                gate.flush()
+            gate.seek(0)
+            msvcrt.locking(gate.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(gate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return gate
+    except OSError:
+        if gate is not None:
+            gate.close()
+        return None
+
+
 def _take_lock(now, token=""):
+    """Acquire the usage lock without stealing another session's fresh replacement."""
+    gate = _usage_gate()
+    if gate is None:
+        return False
+    try:
+        return _take_lock_held(now, token)
+    finally:
+        gate.close()
+
+
+def _take_lock_held(now, token):
     """Create the usage lock holding `token` (who owns it); False when a fresh one exists.
 
-    A stale lock is taken over by moving it aside first: only one of several sessions can
-    win that rename, so the others see it fail and give up without touching the new lock.
+    The OS gate stays held across the stale check and replacement, so another
+    session cannot replace or release the lock between those operations.
     """
     try:
         return _make_lock(token)
@@ -843,6 +885,9 @@ def _make_lock(token):
 
 def _release_lock(token):
     """Remove the usage lock, but only if it still holds our token (it may be someone else's by now)."""
+    gate = _usage_gate()
+    if gate is None:
+        return
     try:
         with open(USAGE_LOCK, encoding="utf-8") as f:
             mine = token and f.read() == token
@@ -850,6 +895,8 @@ def _release_lock(token):
             os.unlink(USAGE_LOCK)
     except OSError:
         pass
+    finally:
+        gate.close()
 
 
 REFRESH_DEADLINE = 15  # seconds the detached refresh may live, however slow the network is
@@ -1562,7 +1609,7 @@ MARKER_REASON_ROOM = 8  # free columns the bare marker needs before it adds its 
 
 
 def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, width=None):
-    """The status line: ONE line, never wider than `width` columns (None: no limit).
+    """One status line, fitted to `width` down to the core meters (None: no limit).
 
     usage: merge_usage() result, or None when nothing is known yet. extras: gather_extras()'s
     result; without it only the session's own items show. Left to right:
@@ -1583,9 +1630,8 @@ def format_statusline(data, usage=None, now=None, show_usage=True, extras=None, 
          columns, its one-word reason ('▲discord'); it outlasts everything below except model
          and percentages,
       6. the session name,
-      7. the branch: first project and branch are squeezed into the room left (the longer
-         loses characters from its middle, neither below 14), then the branch is cut to
-         'live-usage…', then its dirty counts go (it stays amber), then the branch itself,
+      7. the branch: cut from its end into the room left while the project stays whole,
+         then dropped with its counts (it stays amber while present),
       8. the project: squeezed down to 14 characters as the room shrinks, then dropped,
       9. the ctx tokens, 10. the bars (7d, then 5h, then ctx), 11. the cost, 12. the effort,
      13. the model name is cut to 8 characters, 14. the bare marker.
@@ -1955,47 +2001,138 @@ def _first_brace(text):
     return -1
 
 
-FACE_RE = r'"face"\s*:\s*"((?:[^"\\]|\\.)*)"'
+def _json_space(text, i):
+    """Skip whitespace and JSONC comments, leaving strings untouched."""
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+        elif text.startswith(("//", "/*"), i):
+            i = _json_skip(text, i)
+        else:
+            break
+    return i
+
+
+def _json_value_end(text, i):
+    """End of one JSONC value, skipping nested objects, arrays, strings and comments."""
+    if text[i] == '"':
+        return _json_skip(text, i)
+    if text[i] not in "{[":
+        while i < len(text) and not text[i].isspace() and text[i] not in ",}]":
+            if text.startswith(("//", "/*"), i):
+                break
+            i += 1
+        return i
+    stack = []
+    while i < len(text):
+        j = _json_skip(text, i)
+        if j != i:
+            i = j
+            continue
+        if text[i] in "{[":
+            stack.append("}" if text[i] == "{" else "]")
+        elif text[i] in "}]":
+            if not stack or text[i] != stack.pop():
+                return -1
+            if not stack:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _json_properties(text, brace):
+    """Direct object properties as key -> (value start, end); None for an invalid object.
+
+    Only active keys at this level count. Keep the original text so comments and unrelated settings
+    survive the edit without requiring a JSONC dependency.
+    """
+    if brace < 0 or brace >= len(text) or text[brace] != "{":
+        return None
+    properties, i = {}, _json_space(text, brace + 1)
+    while i < len(text) and text[i] != "}":
+        if text[i] != '"':
+            return None
+        end = _json_skip(text, i)
+        try:
+            key = json.loads(text[i:end])
+        except ValueError:
+            return None
+        i = _json_space(text, end)
+        if i >= len(text) or text[i] != ":":
+            return None
+        start = _json_space(text, i + 1)
+        if start >= len(text):
+            return None
+        end = _json_value_end(text, start)
+        if end <= start:
+            return None
+        properties[key] = (start, end)
+        i = _json_space(text, end)
+        if i < len(text) and text[i] == ",":
+            i = _json_space(text, i + 1)
+        elif i >= len(text) or text[i] != "}":
+            return None
+    return properties if i < len(text) else None
+
+
+def _json_add_property(text, brace, properties, key, value):
+    encoded = json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        encoded = "{ " + encoded[1:-1] + " }"
+    addition = f" {json.dumps(key)}: {encoded}"
+    if properties:
+        addition += ","
+    return text[:brace + 1] + addition + text[brace + 1:]
 
 
 def _wt_font_edit(text, face):
     """(new text, outcome) for a Windows Terminal settings file. profiles.defaults gets the font face:
     'set' (added or replaced a non-Nerd face), 'kept' (already a Nerd Font), 'none' (no defaults block)."""
-    m = re.search(r'"defaults"\s*:\s*\{', text)
-    if not m:
+    brace = _first_brace(text)
+    properties = _json_properties(text, brace)
+    for key in ("profiles", "defaults"):
+        if properties is None or key not in properties:
+            return text, "none"
+        brace = properties[key][0]
+        properties = _json_properties(text, brace)
+    if properties is None:
         return text, "none"
-    open_idx = m.end() - 1
-    close = _json_close(text, open_idx)
-    if close < 0:
+    if "font" not in properties:
+        return _json_add_property(text, brace, properties, "font", {"face": face}), "set"
+    brace = properties["font"][0]
+    properties = _json_properties(text, brace)
+    if properties is None:
         return text, "none"
-    block = text[open_idx + 1:close]
-    fm = re.search(r'"font"\s*:\s*\{', block)
-    if not fm:
-        return text[:open_idx + 1] + f' "font": {{ "face": "{face}" }},' + text[open_idx + 1:], "set"
-    f_open = open_idx + 1 + fm.end() - 1
-    f_close = _json_close(text, f_open)
-    font_text = text[f_open:f_close + 1]
-    am = re.search(FACE_RE, font_text)
-    if am is None:
-        return text[:f_open + 1] + f' "face": "{face}",' + text[f_open + 1:], "set"
-    if "nerd" in am.group(1).lower():
+    if "face" not in properties:
+        return _json_add_property(text, brace, properties, "face", face), "set"
+    start, end = properties["face"]
+    try:
+        old = json.loads(text[start:end])
+    except ValueError:
+        return text, "none"
+    if isinstance(old, str) and "nerd" in old.lower():
         return text, "kept"
-    s, e = f_open + am.start(1), f_open + am.end(1)
-    return text[:s] + face + text[e:], "set"
+    return text[:start] + json.dumps(face, ensure_ascii=False) + text[end:], "set"
 
 
 def _vscode_font_edit(text, face):
     """(new text, outcome) for VS Code user settings: terminal.integrated.fontFamily gets the Nerd Font first."""
-    m = re.search(r'"terminal\.integrated\.fontFamily"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-    if m:
-        if "nerd" in m.group(1).lower():
-            return text, "kept"
-        old = m.group(1)
-        return text[:m.start(1)] + f"{face}, {old}" + text[m.end(1):], "set"
     brace = _first_brace(text)
-    if brace < 0:
+    properties = _json_properties(text, brace)
+    if properties is None:
         return text, "none"
-    return text[:brace + 1] + f' "terminal.integrated.fontFamily": "{face}",' + text[brace + 1:], "set"
+    key = "terminal.integrated.fontFamily"
+    if key not in properties:
+        return _json_add_property(text, brace, properties, key, face), "set"
+    start, end = properties[key]
+    try:
+        old = json.loads(text[start:end])
+    except ValueError:
+        return text, "none"
+    if isinstance(old, str) and "nerd" in old.lower():
+        return text, "kept"
+    new = f"{face}, {old}" if isinstance(old, str) and old else face
+    return text[:start] + json.dumps(new, ensure_ascii=False) + text[end:], "set"
 
 
 def _terminal_settings_files():
@@ -2057,8 +2194,14 @@ def _configure_terminals(face, save_copy, dry=False):
 def _launch_command(python, claude_dir, icons):
     """The statusLine command: python -S importing the copied module, so its compiled .pyc is reused."""
     default = os.path.abspath(os.path.join(HOME, ".claude"))
-    where = "~/.claude" if os.path.abspath(claude_dir) == default else claude_dir.replace("\\", "/")
-    code = f"import os,sys;sys.path.insert(0,os.path.expanduser('{where}'));import statusline;statusline.main()"
+    if os.path.abspath(claude_dir) == default:
+        setup = "sys.path.insert(0,os.path.expanduser('~/.claude'))"
+    else:
+        # Hex keeps paths out of both Python string syntax and the command shell's syntax.
+        encoded = os.fsencode(os.path.abspath(claude_dir)).hex()
+        setup = (f"p=os.fsdecode(bytes.fromhex('{encoded}'));"
+                 "os.environ['CLAUDE_CONFIG_DIR']=p;sys.path.insert(0,p)")
+    code = f"import os,sys;{setup};import statusline;statusline.main()"
     return f'{python} -S -c "{code}"' + (" --icons nerd" if icons == "nerd" else "")
 
 
@@ -2127,13 +2270,19 @@ def install_main(args):
     except (OSError, ValueError):
         pass
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = None
 
     def save_copy(path, label=None):
         """Copy path into this run's backup folder (never in a dry run); the folder, or None."""
         if dry:
             return None
-        dest = os.path.join(cdir, "backups", f"statusline-{stamp}")
-        os.makedirs(dest, exist_ok=True)
+        nonlocal backup_dir
+        if backup_dir is None:
+            import tempfile
+            root = os.path.join(cdir, "backups")
+            os.makedirs(root, exist_ok=True)
+            backup_dir = tempfile.mkdtemp(prefix=f"statusline-{stamp}-", dir=root)
+        dest = backup_dir
         name = os.path.basename(path) if label is None else f"{label}-{os.path.basename(path)}"
         shutil.copy2(path, os.path.join(dest, name))
         return dest
@@ -2210,6 +2359,13 @@ def install_main(args):
         return 0
     os.makedirs(cdir, exist_ok=True)
     backed_up = backup()
+    originals = {}
+    for path in (settings_path, record_path, dest):
+        try:
+            with open(path, "rb") as f:
+                originals[path] = f.read()
+        except FileNotFoundError:
+            originals[path] = None
     try:
         same = os.path.exists(dest) and os.path.samefile(dest, __file__)
     except OSError:
@@ -2230,12 +2386,17 @@ def install_main(args):
     if "--no-test" not in args:
         ok, out = _smoke_test(command)
         if not ok:
-            original = dict(settings)
-            if previous:
-                original["statusLine"] = previous
-            else:
-                original.pop("statusLine", None)
-            _write_json(settings_path, original)
+            for path, content in originals.items():
+                if content is None:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    tmp = f"{path}.{os.getpid()}.tmp"
+                    with open(tmp, "wb") as f:
+                        f.write(content)
+                    os.replace(tmp, path)
             print(f"statusline: the status line failed its self-test, so settings.json was put back.\n  {out}")
             return 1
         sample = re.sub(r"\x1b\[[0-9;]*m", "", out.splitlines()[0] if out else "")
